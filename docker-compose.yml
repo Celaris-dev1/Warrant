@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: warrant
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 20
+  warrantd:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      WARRANT_DATABASE_URL: postgres://postgres:postgres@postgres:5432/warrant
+      WARRANT_ADMIN_TOKEN: ${WARRANT_ADMIN_TOKEN:-change-me-admin-token}
+      WARRANT_SIGNING_KEY: ${WARRANT_SIGNING_KEY:-}
+      WARRANT_POLICY: /etc/warrant/policy.json
+      WARRANT_ROUTES: /etc/warrant/routes.json
+      LEDGER_URL: ${LEDGER_URL:-}
+      LEDGER_TOKEN: ${LEDGER_TOKEN:-}
+    ports: ["8430:8430", "8431:8431"]

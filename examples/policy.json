@@ -1,0 +1,10 @@
+{
+  "version": "example-v1",
+  "rules": [
+    {"id": "mint-any", "effect": "permit", "action": "mint", "principal": "spiffe://warrant.local/workload/*"},
+    {"id": "delegate-any", "effect": "permit", "action": "delegate"},
+    {"id": "calls", "effect": "permit", "action": "call"},
+    {"id": "no-secrets", "effect": "forbid", "action": "call", "resource": "secrets/*"},
+    {"id": "no-drop", "effect": "forbid", "action": "call", "tool": "db.exec", "when": {"args": {"stmt": {"pattern": "DROP*"}}}}
+  ]
+}

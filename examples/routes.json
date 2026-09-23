@@ -1,0 +1,3 @@
+[
+  {"tool": "*", "upstream": "http://localhost:8499/tool"}
+]
