@@ -18,9 +18,20 @@ import (
 	"github.com/Celaris-dev1/Warrant/internal/attenuate"
 	"github.com/Celaris-dev1/Warrant/internal/ledger"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
+	"github.com/Celaris-dev1/Warrant/internal/receipt"
 	"github.com/Celaris-dev1/Warrant/internal/store"
 	"github.com/Celaris-dev1/Warrant/internal/token"
 )
+
+// receiptKinds maps the ledger record types this service emits to a stack-receipt/v1 "kind",
+// for the subset that are genuine authorization decisions (issuance, allow, deny, revoke) worth
+// a signed cross-product receipt. Bookkeeping types (e.g. workload registration) are skipped.
+var receiptKinds = map[string]string{
+	"warrant.token.issued":  "warrant.decision",
+	"warrant.token.revoked": "warrant.decision",
+	"warrant.call.allowed":  "warrant.decision",
+	"warrant.call.denied":   "warrant.decision",
+}
 
 // Config holds broker settings.
 type Config struct {
@@ -104,11 +115,43 @@ func (s *Service) record(ctx context.Context, typ, human string, agents []string
 	if human == "" {
 		chain[0].ID = "unknown"
 	}
+	if kind, ok := receiptKinds[typ]; ok {
+		s.attachReceipt(ctx, kind, chain, payload)
+	}
 	err := s.Ledger.Record(ctx, ledger.Record{Chain: "warrant", Type: typ, ActorChain: chain,
 		PolicyVersion: s.policyVersion(), Payload: payload, GoalID: strOf(payload["goal_id"])})
 	if err != nil {
 		log.Printf("ledger: %s: %v", typ, err)
 	}
+}
+
+// attachReceipt signs a stack-receipt/v1 envelope over payload and sets payload["receipt"] to
+// it, so Ledger stores and the incident report verify it alongside the record itself. It never
+// fails the caller: a receipt is evidence in addition to the ledger record, not a precondition
+// for recording the decision.
+func (s *Service) attachReceipt(ctx context.Context, kind string, actors []ledger.Actor, payload map[string]any) {
+	if s.Signer == nil || s.Signer.Priv == nil {
+		return
+	}
+	ph, err := receipt.PayloadHash(payload)
+	if err != nil {
+		log.Printf("receipt: payload_hash: %v", err)
+		return
+	}
+	racts := make([]receipt.Actor, len(actors))
+	for i, a := range actors {
+		racts[i] = receipt.Actor{Kind: a.Kind, ID: a.ID, Model: a.Model, ModelVersion: a.ModelVersion}
+	}
+	subject := strOf(payload["token_id"])
+	env, err := receipt.Sign(ctx, receipt.Ed25519Signer{Key: s.Signer.Priv}, receipt.Envelope{
+		Product: "warrant", Kind: kind, GoalID: strOf(payload["goal_id"]), Actors: racts,
+		Subject: subject, PayloadHash: ph,
+	})
+	if err != nil {
+		log.Printf("receipt: sign: %v", err)
+		return
+	}
+	payload["receipt"] = env
 }
 
 func strOf(v any) string { s, _ := v.(string); return s }

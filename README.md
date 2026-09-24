@@ -155,7 +155,12 @@ A constrained argument has to be present in the call.
 - **Ledger.** Emits `warrant.token.issued` (for delegations it includes
   parent scopes, requested scopes, granted scopes and budgets, so the
   narrowing is auditable), `warrant.call.allowed`, `warrant.call.denied` and
-  `warrant.token.revoked`. The actor chain is always `[human, agent…]`.
+  `warrant.token.revoked`. The actor chain is always `[human, agent…]`. Each of these four
+  decision records also carries a signed `payload.receipt`: a `stack-receipt/v1` envelope
+  (`internal/receipt`, self-contained copy of Ledger's `docs/receipt-spec.md` reference
+  implementation, validated against Ledger's conformance vectors in `testdata/receipts/`)
+  signed with the broker's own Ed25519 token-signing key, so `ledger incident` can verify the
+  decision independently of trusting Ledger's storage.
 
 ### HTTP API (broker, :8430)
 
