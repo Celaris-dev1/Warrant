@@ -167,6 +167,9 @@ type MintRequest struct {
 	MaxCalls int           `json:"max_calls"`
 	MaxDepth int           `json:"max_depth"`
 	GoalID   string        `json:"goal_id,omitempty"`
+	// Cnf, if set, holder-binds the issued token to a public key (PoP
+	// required at the PEP for every call; see internal/pop).
+	Cnf *token.Cnf `json:"cnf,omitempty"`
 }
 
 // Issued is returned for any new capability token.
@@ -238,7 +241,7 @@ func (s *Service) MintRoot(ctx context.Context, r MintRequest) (Issued, error) {
 	now := s.Now()
 	c := token.Claims{ID: token.NewID(), Issuer: s.issuer(), Subject: svid.Subject, Human: r.Human, IssuedAt: now.Unix(),
 		Expires: s.ttl(r.TTL, time.Unix(svid.Expires, 0)).Unix(), Depth: 0, MaxDepth: md, MaxCalls: mc, Scopes: r.Scopes, Kind: "capability",
-		ParentActor: svid.Subject, GoalID: r.GoalID}
+		ParentActor: svid.Subject, GoalID: r.GoalID, Cnf: r.Cnf}
 	iss, err := s.persist(ctx, c)
 	if err != nil {
 		return Issued{}, err
@@ -295,6 +298,11 @@ type DelegateRequest struct {
 	MaxCalls    int           `json:"max_calls"`
 	MaxDepth    int           `json:"max_depth"`
 	GoalID      string        `json:"goal_id,omitempty"`
+	// Cnf, if set, holder-binds the child token to a (typically fresh, the
+	// child's own) public key. If unset, the child is not holder-bound even
+	// if the parent was — attenuation only narrows authority, it never
+	// forces a binding requirement the requester didn't ask for.
+	Cnf *token.Cnf `json:"cnf,omitempty"`
 }
 
 // Delegate issues B a token that is the structural intersection of A's
@@ -366,7 +374,7 @@ func (s *Service) Delegate(ctx context.Context, r DelegateRequest) (Issued, erro
 	c := token.Claims{ID: token.NewID(), Issuer: s.issuer(), Subject: csvid.Subject, Human: parent.Human, IssuedAt: now.Unix(),
 		Expires: s.ttl(r.TTL, time.Unix(parent.Expires, 0)).Unix(), Parent: parent.ID, Chain: parent.Lineage(),
 		Depth: depth, MaxDepth: md, MaxCalls: mc, Scopes: scopes, Kind: "capability",
-		ParentActor: parent.Subject, GoalID: goalID}
+		ParentActor: parent.Subject, GoalID: goalID, Cnf: r.Cnf}
 	if c.Expires > csvid.Expires {
 		c.Expires = csvid.Expires
 	}
