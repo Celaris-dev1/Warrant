@@ -51,6 +51,13 @@ type Service struct {
 	Policy *policy.Set
 	Ledger ledger.Recorder
 	Now    func() time.Time
+
+	// ReceiptSigner signs stack-receipt/v1 envelopes (see attachReceipt). It is
+	// independent of Signer, which signs capability tokens: a persistent key set
+	// here (e.g. via receipt.DefaultSigner in cmd/warrantd) keeps signer_key_id
+	// stable across restarts even if the token signing key rotates. If nil,
+	// Signer.Priv is used instead, so existing callers keep working unchanged.
+	ReceiptSigner *receipt.Ed25519Signer
 }
 
 // Errors.
@@ -130,7 +137,13 @@ func (s *Service) record(ctx context.Context, typ, human string, agents []string
 // fails the caller: a receipt is evidence in addition to the ledger record, not a precondition
 // for recording the decision.
 func (s *Service) attachReceipt(ctx context.Context, kind string, actors []ledger.Actor, payload map[string]any) {
-	if s.Signer == nil || s.Signer.Priv == nil {
+	var signer receipt.Ed25519Signer
+	switch {
+	case s.ReceiptSigner != nil:
+		signer = *s.ReceiptSigner
+	case s.Signer != nil && s.Signer.Priv != nil:
+		signer = receipt.Ed25519Signer{Key: s.Signer.Priv}
+	default:
 		return
 	}
 	ph, err := receipt.PayloadHash(payload)
@@ -143,7 +156,7 @@ func (s *Service) attachReceipt(ctx context.Context, kind string, actors []ledge
 		racts[i] = receipt.Actor{Kind: a.Kind, ID: a.ID, Model: a.Model, ModelVersion: a.ModelVersion}
 	}
 	subject := strOf(payload["token_id"])
-	env, err := receipt.Sign(ctx, receipt.Ed25519Signer{Key: s.Signer.Priv}, receipt.Envelope{
+	env, err := receipt.Sign(ctx, signer, receipt.Envelope{
 		Product: "warrant", Kind: kind, GoalID: strOf(payload["goal_id"]), Actors: racts,
 		Subject: subject, PayloadHash: ph,
 	})
