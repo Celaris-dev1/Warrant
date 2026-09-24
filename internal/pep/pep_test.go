@@ -3,6 +3,7 @@ package pep
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Celaris-dev1/Warrant/internal/attenuate"
 	"github.com/Celaris-dev1/Warrant/internal/broker"
 	"github.com/Celaris-dev1/Warrant/internal/pop"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
@@ -141,4 +143,74 @@ func TestPoPNotRequiredForUnboundToken(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("unbound token: status = %d, want 200", resp.StatusCode)
 	}
+}
+
+// TestPoPBindsToFinalHolderOfAttenuatedChain verifies that when a token is
+// presented as an offline attenuation chain (internal/attenuate) whose
+// blocks rebind the PoP holder key, the PEP requires a proof from that
+// FINAL key, not the token's original cnf key.
+func TestPoPBindsToFinalHolderOfAttenuatedChain(t *testing.T) {
+	svc, gw, svidTok, _ := setup(t)
+	ctx := context.Background()
+
+	origPub, origPriv, err := pop.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := svc.MintRoot(ctx, broker.MintRequest{SVID: svidTok, Human: "h",
+		Scopes: []token.Scope{{Tool: "fs.read", Resources: []string{"*"}, MaxCalls: 5}},
+		Cnf:    &token.Cnf{JKT: token.Thumbprint(origPub)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newPub, newPriv, err := pop.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := attenuate.New(root.Token).AppendCnf(origPriv, nil, 0, &token.Cnf{JKT: token.Thumbprint(newPub)}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainJSON, err := json.Marshal(chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	call := func(priv ed25519.PrivateKey, pub ed25519.PublicKey) *http.Response {
+		body, _ := json.Marshal(map[string]any{"resource": "x"})
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/call/fs.read", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+string(chainJSON))
+		req.Header.Set("X-Warrant-SVID", svidTok)
+		if priv != nil {
+			proof, err := pop.Sign(priv, root.Claims.ID, gw.Audience, http.MethodPost, "/call/fs.read", 30*time.Second, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Warrant-PoP", proof)
+			req.Header.Set("X-Warrant-PoP-Key", base64.RawURLEncoding.EncodeToString(pub))
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// The ORIGINAL holder key no longer works: the chain rebound to a new one.
+	resp := call(origPriv, origPub)
+	if resp.StatusCode != 401 {
+		t.Fatalf("original holder key after rebind: status = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// The NEW (final) holder key is required and accepted.
+	resp = call(newPriv, newPub)
+	if resp.StatusCode != 200 {
+		t.Fatalf("final holder key: status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

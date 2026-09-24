@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Celaris-dev1/Warrant/internal/attenuate"
 	"github.com/Celaris-dev1/Warrant/internal/ledger"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
 	"github.com/Celaris-dev1/Warrant/internal/store"
@@ -274,6 +275,9 @@ func (s *Service) persist(ctx context.Context, c token.Claims) (Issued, error) {
 // checkLive verifies a capability token and that no token in its lineage is
 // revoked.
 func (s *Service) checkLive(ctx context.Context, tok string) (token.Claims, error) {
+	if looksLikeAttenuationChain(tok) {
+		return s.checkLiveChain(ctx, tok)
+	}
 	c, err := s.verifyKind(tok, "capability")
 	if err != nil {
 		return c, err
@@ -285,6 +289,48 @@ func (s *Service) checkLive(ctx context.Context, tok string) (token.Claims, erro
 	if r != "" {
 		return c, fmt.Errorf("%w (%s)", ErrRevoked, r)
 	}
+	return c, nil
+}
+
+// looksLikeAttenuationChain distinguishes an offline attenuation chain
+// (internal/attenuate.Chain, presented as a JSON object) from a compact
+// broker-signed JWT.
+func looksLikeAttenuationChain(tok string) bool {
+	t := strings.TrimSpace(tok)
+	return strings.HasPrefix(t, "{")
+}
+
+// checkLiveChain verifies an offline-attenuated credential (see
+// internal/attenuate): the base token's signature/expiry, every block's
+// signature and chain linkage, and that the chain only ever narrows
+// authority. The returned Claims carry the chain's EFFECTIVE (narrowed)
+// scopes, expiry and cnf, plus ScopeOrigins mapping each effective scope
+// back to the base token's own scope index so the broker's existing
+// per-scope call budgets (indexed by base scope) still apply.
+func (s *Service) checkLiveChain(ctx context.Context, tok string) (token.Claims, error) {
+	var chain attenuate.Chain
+	if err := json.Unmarshal([]byte(tok), &chain); err != nil {
+		return token.Claims{}, fmt.Errorf("bad attenuation chain: %w", err)
+	}
+	eff, err := attenuate.Verify(s.Signer.Pub, chain, s.Now())
+	if err != nil {
+		return token.Claims{}, err
+	}
+	c := eff.Base
+	if c.Kind != "capability" {
+		return c, ErrWrongKind
+	}
+	r, err := s.Store.FirstRevoked(ctx, c.Lineage())
+	if err != nil {
+		return c, err
+	}
+	if r != "" {
+		return c, fmt.Errorf("%w (%s)", ErrRevoked, r)
+	}
+	c.Scopes = eff.Scopes
+	c.Expires = eff.Expires
+	c.Cnf = eff.Cnf
+	c.ScopeOrigins = eff.Origins
 	return c, nil
 }
 
@@ -502,11 +548,40 @@ func (s *Service) authorize(ctx context.Context, r AuthorizeRequest) Decision {
 			return deny(fmt.Errorf("%w: approval already used", ErrApproval))
 		}
 	}
-	if err := s.Store.Consume(ctx, c.ID, idx, c.Lineage()); err != nil {
+	// A chain's effective scopes may be reordered/narrowed relative to the
+	// base token's stored (and budgeted) scopes; ScopeOrigins maps the
+	// matched effective index back to the base scope the broker actually
+	// tracks a counter for.
+	consumeIdx := idx
+	if len(c.ScopeOrigins) == len(c.Scopes) {
+		consumeIdx = c.ScopeOrigins[idx]
+	}
+	if err := s.Store.Consume(ctx, c.ID, consumeIdx, c.Lineage()); err != nil {
 		return deny(err)
 	}
 	d.Allow, d.Reason = true, pd.Reason
 	return d
+}
+
+// Peek verifies a presented credential (a plain capability token or an
+// offline attenuation chain) and its SVID binding WITHOUT evaluating policy
+// or consuming any call budget. It exists for read-only, non-authorizing
+// uses like filtering a tool listing down to what a credential's scopes
+// would even structurally allow; it must never be used to permit an actual
+// tool call.
+func (s *Service) Peek(ctx context.Context, tok, svidTok string) (token.Claims, error) {
+	c, err := s.checkLive(ctx, tok)
+	if err != nil {
+		return c, err
+	}
+	svid, err := s.verifyKind(svidTok, "svid")
+	if err != nil {
+		return c, fmt.Errorf("svid: %w", err)
+	}
+	if svid.Subject != c.Subject {
+		return c, ErrBinding
+	}
+	return c, nil
 }
 
 // Revoke adds a token (and so its whole subtree) to the revoke list.

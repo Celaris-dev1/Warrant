@@ -13,9 +13,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DB_URL="${WARRANT_TEST_DATABASE_URL:-postgres://postgres:postgres@localhost:5432/warrant}"
 DB_NAME="${DB_URL##*/}"
 ADMIN_TOKEN="e2e-admin-$$"
+# One signing key shared by the broker and the gateway process, so tokens
+# the broker mints verify at the gateway (each process otherwise falls back
+# to its own ephemeral key).
+SIGNING_KEY="$(head -c32 /dev/urandom | base64)"
 BROKER_ADDR="127.0.0.1:18430"
 PEP_ADDR="127.0.0.1:18431"
+GATEWAY_ADDR="127.0.0.1:18432"
 UPSTREAM_ADDR="127.0.0.1:18499"
+MCP_UPSTREAM_ADDR="127.0.0.1:18498"
 
 log() { echo "[e2e] $*" >&2; }
 fail() { echo "[e2e] FAIL: $*" >&2; exit 1; }
@@ -23,12 +29,17 @@ fail() { echo "[e2e] FAIL: $*" >&2; exit 1; }
 cleanup() {
 	set +e
 	[[ -n "${BROKER_PID:-}" ]] && kill "$BROKER_PID" 2>/dev/null
+	[[ -n "${GATEWAY_PID:-}" ]] && kill "$GATEWAY_PID" 2>/dev/null
 	[[ -n "${UPSTREAM_PID:-}" ]] && kill "$UPSTREAM_PID" 2>/dev/null
+	[[ -n "${MCP_UPSTREAM_PID:-}" ]] && kill "$MCP_UPSTREAM_PID" 2>/dev/null
 	rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 WORKDIR="$(mktemp -d)"
+
+log "building warrantd"
+go build -o "$WORKDIR/warrantd" ./cmd/warrantd
 
 log "checking Postgres is reachable..."
 if ! psql "$DB_URL" -c 'select 1' >/dev/null 2>&1; then
@@ -68,7 +79,8 @@ func main() {
 	log.Fatal(http.ListenAndServe(os.Args[1], nil))
 }
 GOEOF
-go run "$WORKDIR/upstream.go" "$UPSTREAM_ADDR" &
+go build -o "$WORKDIR/upstream" "$WORKDIR/upstream.go"
+"$WORKDIR/upstream" "$UPSTREAM_ADDR" &
 UPSTREAM_PID=$!
 sleep 1
 
@@ -81,10 +93,11 @@ WARRANT_ADMIN_TOKEN="$ADMIN_TOKEN" \
 WARRANT_POLICY="examples/policy.json" \
 WARRANT_ROUTES="$WORKDIR/routes.json" \
 WARRANT_DATABASE_URL="$DB_URL" \
+WARRANT_SIGNING_KEY="$SIGNING_KEY" \
 WARRANT_ADDR=":${BROKER_ADDR##*:}" \
 WARRANT_PEP_ADDR=":${PEP_ADDR##*:}" \
 LEDGER_SPOOL_DIR="$WORKDIR/ledger-spool" \
-go run ./cmd/warrantd &
+"$WORKDIR/warrantd" &
 BROKER_PID=$!
 
 for i in $(seq 1 30); do
@@ -137,5 +150,84 @@ REV_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://$PEP_ADDR/ca
 	-H "Authorization: Bearer $KID_TOKEN" -H "X-Warrant-SVID: $WORKER_SVID" -H 'Content-Type: application/json' \
 	-d '{"resource":"repo/e2e/docs/intro.md"}')
 [[ "$REV_STATUS" == "403" ]] || fail "revoked descendant: status=$REV_STATUS, want 403"
+
+log "starting fake MCP upstream on $MCP_UPSTREAM_ADDR"
+cat > "$WORKDIR/mcp_upstream.go" <<'GOEOF'
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+)
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		json.NewDecoder(r.Body).Decode(&m)
+		w.Header().Set("Content-Type", "application/json")
+		switch m["method"] {
+		case "tools/call":
+			params, _ := m["params"].(map[string]any)
+			json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": m["id"],
+				"result": map[string]any{"ok": true, "name": params["name"]}})
+		default:
+			json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": m["id"], "result": map[string]any{}})
+		}
+	})
+	log.Fatal(http.ListenAndServe(os.Args[1], nil))
+}
+GOEOF
+go build -o "$WORKDIR/mcp_upstream" "$WORKDIR/mcp_upstream.go"
+"$WORKDIR/mcp_upstream" "$MCP_UPSTREAM_ADDR" &
+MCP_UPSTREAM_PID=$!
+sleep 1
+
+log "starting warrantd gateway (mcp) on $GATEWAY_ADDR -> $MCP_UPSTREAM_ADDR"
+WARRANT_DATABASE_URL="$DB_URL" \
+WARRANT_POLICY="examples/policy.json" \
+WARRANT_SIGNING_KEY="$SIGNING_KEY" \
+WARRANT_GATEWAY_PROTOCOL="mcp" \
+WARRANT_GATEWAY_UPSTREAM="http://$MCP_UPSTREAM_ADDR/" \
+WARRANT_GATEWAY_ADDR=":${GATEWAY_ADDR##*:}" \
+LEDGER_SPOOL_DIR="$WORKDIR/gateway-ledger-spool" \
+"$WORKDIR/warrantd" gateway &
+GATEWAY_PID=$!
+
+for i in $(seq 1 30); do
+	curl -s -o /dev/null -X POST "http://$GATEWAY_ADDR" -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' && break
+	sleep 0.5
+done
+
+log "minting an mcp-scoped root token"
+GW_ROOT=$(api -X POST "http://$BROKER_ADDR/v1/tokens" -d "{\"svid\":\"$PLANNER_SVID\",\"human\":\"e2e@example.com\",\"scopes\":[{\"tool\":\"mcp.fs.read\",\"resources\":[\"*\"],\"max_calls\":5}]}")
+GW_TOKEN=$(echo "$GW_ROOT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+[[ -n "$GW_TOKEN" ]] || fail "no gateway token"
+
+log "gateway: passthrough initialize (no credentials needed)"
+INIT=$(curl -sf -X POST "http://$GATEWAY_ADDR" -H 'Content-Type: application/json' \
+	-d '{"jsonrpc":"2.0","id":1,"method":"initialize"}')
+echo "$INIT" | grep -q '"result"' || fail "expected initialize to pass through, got: $INIT"
+
+log "gateway: allowed tools/call"
+GCALL=$(curl -sf -X POST "http://$GATEWAY_ADDR" \
+	-H "Authorization: Bearer $GW_TOKEN" -H "X-Warrant-SVID: $PLANNER_SVID" -H 'Content-Type: application/json' \
+	-d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fs.read","arguments":{}}}')
+echo "$GCALL" | grep -q '"ok":true' || fail "expected gateway tools/call to succeed, got: $GCALL"
+
+log "gateway: denied tools/call keeps the JSON-RPC id and returns a structured error"
+GDENY=$(curl -sf -X POST "http://$GATEWAY_ADDR" \
+	-H "Authorization: Bearer $GW_TOKEN" -H "X-Warrant-SVID: $PLANNER_SVID" -H 'Content-Type: application/json' \
+	-d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fs.write","arguments":{}}}')
+echo "$GDENY" | grep -q '"id":3' || fail "denial must preserve id, got: $GDENY"
+echo "$GDENY" | grep -q '"error"' || fail "expected a JSON-RPC error for a denied tools/call, got: $GDENY"
+
+log "gateway: batch request"
+GBATCH=$(curl -sf -X POST "http://$GATEWAY_ADDR" \
+	-H "Authorization: Bearer $GW_TOKEN" -H "X-Warrant-SVID: $PLANNER_SVID" -H 'Content-Type: application/json' \
+	-d '[{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fs.read","arguments":{}}},{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fs.write","arguments":{}}}]')
+echo "$GBATCH" | grep -q '"id":4' || fail "batch missing id 4: $GBATCH"
+echo "$GBATCH" | grep -q '"id":5' || fail "batch missing id 5: $GBATCH"
 
 log "ALL E2E CHECKS PASSED"
