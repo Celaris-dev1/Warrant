@@ -15,10 +15,13 @@ const Schema = `
 CREATE TABLE IF NOT EXISTS warrant_workloads (
   name TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS warrant_tokens (
-  id TEXT PRIMARY KEY, parent TEXT, subject TEXT NOT NULL, human TEXT NOT NULL, depth INT NOT NULL,
+  id TEXT PRIMARY KEY, parent TEXT, parent_actor TEXT, goal_id TEXT, subject TEXT NOT NULL, human TEXT NOT NULL, depth INT NOT NULL,
   max_calls INT NOT NULL, scope_limits INT[] NOT NULL, expires TIMESTAMPTZ NOT NULL, claims JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS warrant_tokens_parent ON warrant_tokens(parent);
+CREATE INDEX IF NOT EXISTS warrant_tokens_goal ON warrant_tokens(goal_id);
+ALTER TABLE warrant_tokens ADD COLUMN IF NOT EXISTS parent_actor TEXT;
+ALTER TABLE warrant_tokens ADD COLUMN IF NOT EXISTS goal_id TEXT;
 CREATE TABLE IF NOT EXISTS warrant_revocations (
   id TEXT PRIMARY KEY, reason TEXT NOT NULL, revoked_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS warrant_counters (
@@ -64,21 +67,27 @@ func (p *Postgres) GetWorkload(ctx context.Context, name string) (Workload, erro
 }
 
 func (p *Postgres) PutToken(ctx context.Context, t TokenRecord) error {
-	var parent *string
+	var parent, parentActor, goalID *string
 	if t.Parent != "" {
 		parent = &t.Parent
 	}
-	_, err := p.DB.Exec(ctx, `INSERT INTO warrant_tokens(id,parent,subject,human,depth,max_calls,scope_limits,expires,claims)
-	  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, t.ID, parent, t.Subject, t.Human, t.Depth, t.MaxCalls, t.ScopeLimits, t.Expires, t.Claims)
+	if t.ParentActor != "" {
+		parentActor = &t.ParentActor
+	}
+	if t.GoalID != "" {
+		goalID = &t.GoalID
+	}
+	_, err := p.DB.Exec(ctx, `INSERT INTO warrant_tokens(id,parent,parent_actor,goal_id,subject,human,depth,max_calls,scope_limits,expires,claims)
+	  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, t.ID, parent, parentActor, goalID, t.Subject, t.Human, t.Depth, t.MaxCalls, t.ScopeLimits, t.Expires, t.Claims)
 	return err
 }
 
-const tokCols = `id,COALESCE(parent,''),subject,human,depth,max_calls,scope_limits,expires,claims`
+const tokCols = `id,COALESCE(parent,''),COALESCE(parent_actor,''),COALESCE(goal_id,''),subject,human,depth,max_calls,scope_limits,expires,claims`
 
 func scanTok(r pgx.Row) (TokenRecord, error) {
 	var t TokenRecord
 	var limits []int32
-	err := r.Scan(&t.ID, &t.Parent, &t.Subject, &t.Human, &t.Depth, &t.MaxCalls, &limits, &t.Expires, &t.Claims)
+	err := r.Scan(&t.ID, &t.Parent, &t.ParentActor, &t.GoalID, &t.Subject, &t.Human, &t.Depth, &t.MaxCalls, &limits, &t.Expires, &t.Claims)
 	for _, l := range limits {
 		t.ScopeLimits = append(t.ScopeLimits, int(l))
 	}

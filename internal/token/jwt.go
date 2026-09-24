@@ -22,6 +22,15 @@ type Claims struct {
 	IssuedAt int64   `json:"iat"`
 	Expires  int64   `json:"exp"`
 	Parent   string  `json:"parent,omitempty"`
+	// ParentActor is the SPIFFE subject of the principal that requested this
+	// token's issuance (the parent token's holder for a delegation, or the
+	// minting workload for a root token). Kept alongside Parent (the parent
+	// token id) so a record still names the responsible actor even after the
+	// parent token itself has expired or been pruned.
+	ParentActor string  `json:"parent_actor,omitempty"`
+	// GoalID threads the originating task/goal through the whole delegation
+	// chain so records (and revocation/audit) can be grouped by goal.
+	GoalID   string  `json:"goal_id,omitempty"`
 	Chain    []string `json:"chain,omitempty"` // ancestor ids, root first
 	Depth    int     `json:"depth"`
 	MaxDepth int     `json:"max_depth"`
