@@ -22,6 +22,21 @@ type Claims struct {
 	IssuedAt int64   `json:"iat"`
 	Expires  int64   `json:"exp"`
 	Parent   string  `json:"parent,omitempty"`
+	// ParentActor is the SPIFFE subject of the principal that requested this
+	// token's issuance (the parent token's holder for a delegation, or the
+	// minting workload for a root token). Kept alongside Parent (the parent
+	// token id) so a record still names the responsible actor even after the
+	// parent token itself has expired or been pruned.
+	ParentActor string  `json:"parent_actor,omitempty"`
+	// GoalID threads the originating task/goal through the whole delegation
+	// chain so records (and revocation/audit) can be grouped by goal.
+	GoalID   string  `json:"goal_id,omitempty"`
+	// Cnf is an RFC 7800-style "confirmation" claim binding this token to a
+	// holder public key (JWK SHA-256 thumbprint, RFC 7638 style, over the
+	// raw Ed25519 public key bytes). When set, presenting the token alone is
+	// not enough: the caller must also present a fresh proof-of-possession
+	// signed by the matching private key (see internal/pop).
+	Cnf *Cnf `json:"cnf,omitempty"`
 	Chain    []string `json:"chain,omitempty"` // ancestor ids, root first
 	Depth    int     `json:"depth"`
 	MaxDepth int     `json:"max_depth"`
@@ -31,6 +46,18 @@ type Claims struct {
 	// Approval-only fields.
 	ActionHash string `json:"action_hash,omitempty"`
 	Token      string `json:"tok,omitempty"`
+}
+
+// Cnf is the "jkt" confirmation claim: the base64url-encoded SHA-256
+// thumbprint of the holder's raw Ed25519 public key.
+type Cnf struct {
+	JKT string `json:"jkt"`
+}
+
+// Thumbprint returns the cnf/jkt value for a raw Ed25519 public key.
+func Thumbprint(pub ed25519.PublicKey) string {
+	h := sha256.Sum256(pub)
+	return b64.EncodeToString(h[:])
 }
 
 // Lineage returns chain + self.

@@ -56,6 +56,29 @@ func FromEnv() Recorder {
 	return &Client{URL: u, Token: os.Getenv("LEDGER_TOKEN"), HTTP: &http.Client{Timeout: 5 * time.Second}}
 }
 
+// FromEnvSpooling is like FromEnv but wraps a real Client in a
+// SpoolingClient backed by a file under dir (LEDGER_SPOOL_DIR, default
+// "./data/ledger-spool") so writes survive Ledger downtime. Returns Noop
+// (no spooling needed) when LEDGER_URL is unset.
+func FromEnvSpooling(dir string) (Recorder, func() error, error) {
+	u := os.Getenv("LEDGER_URL")
+	if u == "" {
+		return Noop{}, func() error { return nil }, nil
+	}
+	if dir == "" {
+		dir = os.Getenv("LEDGER_SPOOL_DIR")
+	}
+	if dir == "" {
+		dir = "./data/ledger-spool"
+	}
+	c := &Client{URL: u, Token: os.Getenv("LEDGER_TOKEN"), HTTP: &http.Client{Timeout: 5 * time.Second}}
+	sc, err := NewSpoolingClient(c, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sc, sc.Close, nil
+}
+
 func (c *Client) Record(ctx context.Context, r Record) error {
 	if len(r.ActorChain) == 0 || r.ActorChain[0].Kind != "human" {
 		return fmt.Errorf("ledger: actor_chain must start with a human")

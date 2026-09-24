@@ -21,6 +21,8 @@ type Workload struct {
 type TokenRecord struct {
 	ID          string    `json:"id"`
 	Parent      string    `json:"parent,omitempty"`
+	ParentActor string    `json:"parent_actor,omitempty"`
+	GoalID      string    `json:"goal_id,omitempty"`
 	Subject     string    `json:"subject"`
 	Human       string    `json:"human"`
 	Depth       int       `json:"depth"`

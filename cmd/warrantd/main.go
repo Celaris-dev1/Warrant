@@ -84,8 +84,13 @@ func main() {
 		}
 	}
 	depth, _ := strconv.Atoi(env("WARRANT_MAX_DEPTH", "1"))
+	rec, closeLedger, err := ledger.FromEnvSpooling(os.Getenv("LEDGER_SPOOL_DIR"))
+	if err != nil {
+		log.Fatalf("ledger: %v", err)
+	}
+	defer closeLedger()
 	svc := broker.New(broker.Config{TrustDomain: env("WARRANT_TRUST_DOMAIN", "warrant.local"), MaxDepth: depth},
-		st, signer, pol, ledger.FromEnv())
+		st, signer, pol, rec)
 
 	pepSrv := &http.Server{Addr: env("WARRANT_PEP_ADDR", ":8431"), Handler: pep.New(svc, routes), ReadHeaderTimeout: 5 * time.Second}
 	go func() {

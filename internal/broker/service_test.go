@@ -83,3 +83,69 @@ func TestDelegationRequiresHolderSVIDAndPolicy(t *testing.T) {
 		t.Fatal("capability token accepted as SVID")
 	}
 }
+
+// TestGoalIDAndParentActorPersist covers the previously-dropped fields: a
+// chain's goal_id must survive delegation (inherited when omitted) and every
+// token must record the actor that caused it to be issued.
+func TestGoalIDAndParentActorPersist(t *testing.T) {
+	ctx := context.Background()
+	s := svc(t, `{"rules":[{"id":"m","effect":"permit","action":"mint","allow_depth":2},{"id":"d","effect":"permit","action":"delegate"}]}`)
+	a, b, c := svid(t, s, "a"), svid(t, s, "b"), svid(t, s, "c")
+
+	root, err := s.MintRoot(ctx, MintRequest{SVID: a, Human: "h", Scopes: sc, GoalID: "goal-1", MaxDepth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Claims.GoalID != "goal-1" {
+		t.Fatalf("root goal_id = %q, want goal-1", root.Claims.GoalID)
+	}
+	rootRec, err := s.Store.GetToken(ctx, root.Claims.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootRec.GoalID != "goal-1" {
+		t.Fatalf("persisted root goal_id = %q, want goal-1", rootRec.GoalID)
+	}
+	if rootRec.ParentActor != a2subject(t, s, a) {
+		t.Fatalf("root parent_actor = %q, want minting workload's subject", rootRec.ParentActor)
+	}
+
+	// Delegate without goal_id: it must be inherited from the parent.
+	kid, err := s.Delegate(ctx, DelegateRequest{ParentToken: root.Token, ParentSVID: a, ChildSVID: b, Scopes: sc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kid.Claims.GoalID != "goal-1" {
+		t.Fatalf("child goal_id = %q, want inherited goal-1", kid.Claims.GoalID)
+	}
+	kidRec, err := s.Store.GetToken(ctx, kid.Claims.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kidRec.GoalID != "goal-1" {
+		t.Fatalf("persisted child goal_id = %q, want goal-1", kidRec.GoalID)
+	}
+	if kidRec.ParentActor != root.Claims.Subject {
+		t.Fatalf("child parent_actor = %q, want %q (the delegating holder)", kidRec.ParentActor, root.Claims.Subject)
+	}
+	if kidRec.Parent != root.Claims.ID {
+		t.Fatalf("child parent token id = %q, want %q", kidRec.Parent, root.Claims.ID)
+	}
+
+	// A grandchild can override goal_id explicitly.
+	gc, err := s.Delegate(ctx, DelegateRequest{ParentToken: kid.Token, ParentSVID: b, ChildSVID: c, Scopes: sc, GoalID: "goal-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gc.Claims.GoalID != "goal-2" {
+		t.Fatalf("grandchild goal_id = %q, want explicit override goal-2", gc.Claims.GoalID)
+	}
+}
+
+func a2subject(t *testing.T, s *Service, svidTok string) string {
+	c, err := s.verifyKind(svidTok, "svid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.Subject
+}
