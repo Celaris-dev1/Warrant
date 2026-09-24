@@ -50,16 +50,25 @@ The Go SDK (`sdk/go/warrant`) has the same surface, with a generic
                                         │  allow                    │              (tokens, revocations,
                                         ▼                           ▼               counters, approvals)
                                     real tool                    Ledger (optional)
+
+ MCP/A2A client ──(JSON-RPC + token/chain + SVID)──▶ gateway :8432 ──authorize──▶ broker core (above)
+                                                      │  allow
+                                                      ▼
+                                             upstream MCP server / A2A agent
 ```
 
 | Package | Purpose |
 |---|---|
 | `internal/token` | Scopes, pattern subset/intersection, `Attenuate`, Ed25519 JWT (`alg: EdDSA`), canonical JSON + action hash |
+| `internal/attenuate` | Offline, holder-side attenuation chains (Biscuit-style): signed blocks that only ever narrow a base token's scopes/expiry/holder key, verifiable against just the broker's public key |
+| `internal/pop` | RFC 7800/9449-style holder-bound proof-of-possession for `cnf`-bound tokens, with replay protection |
 | `internal/policy` | JSON Cedar-like rules (`permit`/`forbid` on `mint`/`delegate`/`call`, principal/human/tool/resource patterns, arg/depth/hour conditions), deny-overrides, default deny |
 | `internal/store` | Postgres (pgx/v5) and in-memory stores; atomic lineage call budgets (`SELECT … FOR UPDATE`) |
-| `internal/broker` | Workload identity, root mint, delegation, approvals, authorize, revoke, blast radius; HTTP API |
+| `internal/broker` | Workload identity, root mint, delegation, approvals, authorize (accepts a plain token OR an `internal/attenuate` chain), revoke, blast radius; HTTP API |
 | `internal/pep` | Reverse-proxy gateway: `POST /call/{tool}` → authorize → forward to routed upstream |
+| `internal/gateway` | Protocol-native gateway: speaks MCP (Streamable HTTP JSON-RPC) or A2A JSON-RPC to one upstream, gating `tools/call` / `message/send` / `tasks/*` while passing `initialize`/`tools/list`/notifications through |
 | `internal/ledger` | Ledger `POST /v1/records` client (no-op when `LEDGER_URL` unset) |
+| `adapters` | Framework-facing PEP wrappers: generic HTTP middleware, MCP/A2A/OpenAI/LangChain call gates |
 | `sdk/go/warrant`, `sdk/python/warrant` | Client SDKs with `WrapTool` / `wrap_tool` |
 
 ### Tokens
@@ -92,9 +101,22 @@ A constrained argument has to be present in the call.
   calls. Approval requirements are never dropped. The requester cannot widen
   anything: excess is silently intersected away, and an empty intersection is
   refused.
+- **Offline attenuation.** A holder can narrow a token further, without the
+  broker, by appending signed `internal/attenuate` blocks to it (a
+  bearer-transmissible `Chain`). The broker/PEP/gateway verify the whole
+  chain and enforce the call against `base ∩ every block`: tool, resource,
+  args and expiry only ever shrink, and a block cannot widen or drop the
+  narrowing (`ErrWidened`/`ErrEmpty`), nor detach from its predecessor
+  (`ErrChainBroken`) or forge a signature (`ErrBlockSig`). Revoking the
+  *base* token denies every chain built on it. A block may also rebind the
+  chain's proof-of-possession holder key, but only if it is itself signed by
+  the *current* holder key — otherwise a bearer of just the chain bytes
+  could hijack PoP protection by rebinding to a key of their own.
 - **Shared budgets.** A call charges the presenting token's scope counter
   and the total counter of *every ancestor*. N delegates therefore cannot
-  multiply the root's budget.
+  multiply the root's budget. An attenuation chain shares its base token's
+  budget too — offline blocks are never registered with the broker, so they
+  cannot open a separate one.
 - **Depth cap 1 by default.** Root is depth 0, its delegate is depth 1, and
   that delegate cannot sub-delegate. Deeper chains need a `mint` permit rule
   with `allow_depth` (or a raised `WARRANT_MAX_DEPTH`). Delegation also needs
@@ -139,6 +161,72 @@ Routes come from `WARRANT_ROUTES` (`[{"tool":"fs.*","upstream":"http://…"}]`,
 longest pattern wins). The caller's credentials are never forwarded; the
 upstream receives `X-Warrant-Subject/-Human/-Token-ID/-Action-Hash`.
 
+`Authorization: Bearer` on the PEP (and on the gateway below, and on
+`POST /v1/authorize`) accepts either a plain compact JWT or a JSON-encoded
+`internal/attenuate.Chain` (`{"base_token": "...", "blocks": [...]}`) —
+detected by whether the value starts with `{`. A chain is verified end to
+end (base signature, every block's signature and link, monotonic narrowing)
+and the call is authorized against its *effective* (fully narrowed) scopes,
+expiry and — if any block rebound it — holder key; the broker's own
+per-scope call budget still comes from the base token, since offline blocks
+are never registered with it.
+
+### Gateway (MCP / A2A), `warrantd gateway`
+
+`warrantd gateway` runs `internal/gateway` instead of the broker+PEP: a
+JSON-RPC proxy in front of one upstream MCP server or A2A agent that speaks
+the upstream's own wire protocol (no Warrant-specific request shape), gates
+the calls that exercise authority, and passes protocol plumbing straight
+through.
+
+```bash
+WARRANT_DATABASE_URL=postgres://postgres:postgres@localhost:5432/warrant \
+WARRANT_SIGNING_KEY=<same key as the broker that mints your tokens> \
+WARRANT_POLICY=examples/policy.json \
+WARRANT_GATEWAY_PROTOCOL=mcp \
+WARRANT_GATEWAY_UPSTREAM=http://localhost:9000/ \
+go run ./cmd/warrantd gateway     # listens on :8432 by default
+```
+
+| Env var | Purpose |
+|---|---|
+| `WARRANT_GATEWAY_PROTOCOL` | `mcp` or `a2a` (required) |
+| `WARRANT_GATEWAY_UPSTREAM` | upstream base URL (required) |
+| `WARRANT_GATEWAY_ADDR` | listen address (default `:8432`) |
+| `WARRANT_GATEWAY_TOOL_PREFIX` | overrides the default `mcp.`/`a2a.` scope tool prefix |
+| `WARRANT_GATEWAY_FILTER_TOOLS_LIST` | `true` filters an MCP `tools/list` reply down to tools the credential's scopes structurally allow |
+| `WARRANT_GATEWAY_MAX_BODY_BYTES` | request body cap (default 1 MiB) |
+
+It shares every broker env var (`WARRANT_DATABASE_URL`,
+`WARRANT_SIGNING_KEY`, `WARRANT_POLICY`, `LEDGER_SPOOL_DIR`, …) so a gateway
+instance can be pointed at the same signing key and Postgres as the broker
+minting the tokens it accepts; it does not run the broker's admin HTTP API,
+so `WARRANT_ADMIN_TOKEN` is not required.
+
+- **MCP** (Streamable HTTP JSON-RPC): `initialize`, `tools/list` and
+  `notifications/*` pass straight through; `tools/call` is gated as
+  `{tool_prefix}{params.name}`. With `WARRANT_GATEWAY_FILTER_TOOLS_LIST=true`,
+  `tools/list`'s reply is filtered to tools the presented credential's
+  scopes would allow by name (a best-effort check: no policy rules or
+  argument constraints run at listing time, since there's no call yet).
+- **A2A** (JSON-RPC): `message/send` is gated by its `skill` (or
+  `message.skill`) field, falling back to the method name; every
+  `tasks/*` method (`tasks/get`, `tasks/cancel`, …) is gated by method
+  name. Anything else (e.g. agent-card discovery) passes through.
+- Both accept a JSON-RPC batch (array) request, including a mix of gated,
+  passthrough and notification messages; a fully-denied batch never reaches
+  the upstream at all. A denial is a spec-shaped JSON-RPC error object
+  (code `-32001`, the original request `id` preserved), never an HTTP-level
+  failure — a well-behaved client can react to it like any other tool
+  error. Every gated decision (allow or deny) goes through the same
+  `broker.Service.Authorize` as the PEP, so it emits the same Ledger
+  receipts.
+- `Authorization: Bearer` accepts a plain token or an attenuation chain,
+  exactly like the PEP; `X-Warrant-SVID`, `X-Warrant-Approval`,
+  `X-Warrant-PoP` and `X-Warrant-PoP-Key` all mean the same thing they do
+  there. PoP is checked once per HTTP request (method + this gateway's
+  path), covering every gated JSON-RPC message the request carries.
+
 The environment variables are documented in `cmd/warrantd/main.go`.
 
 ## Tests
@@ -161,11 +249,26 @@ cd sdk/python && python -m unittest discover -s tests
   PEP. It covers attestation, scope denial, token replay with the wrong
   SVID, delegation intersection, depth cap, approval binding/replay,
   forbid-overrides, blast radius, subtree revocation and Ledger emission.
+- `internal/attenuate/attenuate_test.go` and `internal/broker/attenuation_test.go`:
+  narrowing, tampered/widened blocks, a broken chain link, a revoked base
+  token denying every chain built on it, shared base budget accounting, and
+  the current-holder-only cnf rebind.
+- `internal/pep/pep_test.go`: PoP against a chain that rebinds the holder
+  key — the original key stops working, the final one is required.
+- `internal/gateway/gateway_test.go`: fake MCP and A2A upstreams —
+  `tools/call`/`message/send`/`tasks/*` gating (allow/deny, id preserved),
+  `initialize`/`tools/list`/notifications passthrough, `tools/list`
+  filtering, a mixed-outcome JSON-RPC batch, an oversized body, and that a
+  fully-denied request never reaches the upstream.
+- `scripts/e2e.sh` also drives `warrantd gateway` end to end (a fake MCP
+  upstream, an allowed call, a denied call, and a batch).
 
 ## Built vs roadmap
 
-Built: everything above. The tokens are JWTs, not Biscuit; attenuation
-happens at the broker, not offline by the holder.
+Built: everything above. The tokens are JWTs, not Biscuit, but
+`internal/attenuate` layers a Biscuit-style offline attenuation chain on top
+of one: delegation still happens at the broker, and a holder can
+additionally narrow further without it.
 
 Not yet built (the "fully built version"):
 - X.509-SVIDs / real SPIFFE Workload API and node/process attestation.
@@ -178,7 +281,10 @@ Not yet built (the "fully built version"):
 - Signing-key rotation with multiple JWKS keys.
 - Framework adapters (LangGraph, CrewAI, AutoGen). Only the generic Go and
   Python wrappers exist.
-- Latency benchmarking against a low-single-digit-ms target. The PEP reports
-  `X-Warrant-Decision-Ms`, but no benchmark has been run.
-- Streaming or non-JSON tool upstreams. The PEP forwards JSON POSTs only.
+- Latency benchmarking beyond `internal/bench`'s verification-path numbers
+  (see `docs/benchmarks.md`); the PEP separately reports
+  `X-Warrant-Decision-Ms` per call.
+- Streaming or non-JSON tool upstreams. The PEP forwards JSON POSTs only;
+  the gateway speaks MCP/A2A JSON-RPC over Streamable HTTP, not SSE/stdio
+  transports.
 - Pruning of expired rows (tokens, counters, used approvals).

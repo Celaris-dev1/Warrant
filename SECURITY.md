@@ -59,9 +59,61 @@ Warrant assumes:
 - **Ledger durability.** Ledger writes go through a local file spool and
   are retried until delivered, never silently dropped, even across a
   restart (`internal/ledger` `SpoolingClient`).
-- **Bounded request size.** Both the broker HTTP API and the PEP cap
-  request bodies (`http.MaxBytesReader`, 1 MiB) to bound memory use from a
-  hostile or buggy client.
+- **Bounded request size.** The broker HTTP API, the PEP and the gateway
+  (`internal/gateway`) all cap request bodies (`http.MaxBytesReader`,
+  1 MiB by default, configurable for the gateway via
+  `WARRANT_GATEWAY_MAX_BODY_BYTES`) to bound memory use from a hostile or
+  buggy client; an oversized body is rejected before any JSON is parsed.
+- **Attenuation chains are a first-class credential, everywhere.** The
+  broker (`Authorize`/`Peek`), the PEP and the gateway all accept either a
+  plain capability token or a JSON-encoded `internal/attenuate.Chain` in
+  `Authorization: Bearer`. A chain is fully verified (base signature and
+  expiry, every block's signature, chain linkage, and that every block only
+  narrows) before any call is authorized against its effective scopes; a
+  revoked *base* token denies every chain built on it, since the base
+  token's own lineage is what revocation checks. A chain never gets a
+  budget of its own — it shares the base token's broker-tracked per-scope
+  counters — so offline attenuation can restrict what a token can do but
+  can never be used to obtain additional call budget.
+- **PoP holder rebinding requires the current holder.** A chain block may
+  rebind the effective proof-of-possession key (`Block.Cnf`), but `Verify`
+  only accepts it when the block is signed by the key matching the *current*
+  effective `cnf`. Without this, anyone who merely possesses the bearer
+  chain bytes (not the original holder's private key) could rebind PoP
+  protection to a key of their own and defeat it entirely; with it, a
+  rebind is only possible with proof the previous holder authorized the
+  handoff (`internal/attenuate` `TestAttenuationChainCnfRebindRequiresCurrentHolderKey`,
+  `internal/pep` `TestPoPBindsToFinalHolderOfAttenuatedChain`).
+
+## Gateway (`warrantd gateway`, `internal/gateway`)
+
+- The gateway is a protocol-native PEP: it speaks the upstream MCP/A2A
+  server's own JSON-RPC wire format instead of Warrant's `POST
+  /call/{tool}` shape, but every gated message (MCP `tools/call`; A2A
+  `message/send`, `tasks/*`) is authorized through the exact same
+  `broker.Service.Authorize` the PEP uses, so it gets the same guarantees
+  above (workload binding, PoP, shared budgets, policy, revocation,
+  Ledger) — nothing about speaking JSON-RPC bypasses enforcement.
+- A denied gated message is dropped before it ever reaches the upstream;
+  in a batch request, only the allowed (and passthrough/notification)
+  messages are forwarded, each denial coming back as its own spec-shaped
+  JSON-RPC error with the original request `id` preserved. A fully-denied
+  batch makes no upstream request at all.
+- `initialize`, `tools/list` and notifications (MCP), and non-`tasks/*`
+  methods (A2A, e.g. agent-card discovery) pass through **without**
+  authorization, by design — they carry no authority of their own. Do not
+  add a method to that passthrough set unless it is genuinely inert; a
+  gated method accidentally reclassified as passthrough bypasses
+  enforcement entirely.
+- `WARRANT_GATEWAY_FILTER_TOOLS_LIST` is a UX filter, not an enforcement
+  boundary: it checks a credential's scopes structurally (tool name/
+  resource pattern only, via `broker.Service.Peek`, which consumes no
+  budget and runs no policy rule or argument constraint). A tool hidden
+  from the list is still denied for real by `Authorize` if called
+  directly; conversely, a tool shown in a filtered list can still be
+  denied by policy or argument constraints once actually called with
+  arguments. Never rely on the filtered listing itself as an authorization
+  decision.
 
 ## What Warrant does *not* do
 

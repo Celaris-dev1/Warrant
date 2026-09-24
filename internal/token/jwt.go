@@ -46,6 +46,14 @@ type Claims struct {
 	// Approval-only fields.
 	ActionHash string `json:"action_hash,omitempty"`
 	Token      string `json:"tok,omitempty"`
+	// ScopeOrigins, when set, maps each entry of Scopes back to the index
+	// it descends from in the scopes actually stored (and budgeted) by the
+	// broker for this token id. It is populated in-process by the broker
+	// when the presented credential is an offline attenuation chain (see
+	// internal/attenuate) whose effective scopes differ from — but are
+	// verified subsets of — the base token's own scopes; it is never part
+	// of the signed JWT.
+	ScopeOrigins []int `json:"-"`
 }
 
 // Cnf is the "jkt" confirmation claim: the base64url-encoded SHA-256

@@ -12,6 +12,11 @@
 //	WARRANT_ADDR           broker listen address (default :8430)
 //	WARRANT_PEP_ADDR       PEP listen address (default :8431)
 //	LEDGER_URL, LEDGER_TOKEN  Ledger connection (optional)
+//
+// Subcommand:
+//
+//	warrantd gateway   Runs the MCP/A2A protocol gateway instead of the
+//	                   broker+PEP. See runGateway below for its env vars.
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 	"time"
 
 	"github.com/Celaris-dev1/Warrant/internal/broker"
+	"github.com/Celaris-dev1/Warrant/internal/gateway"
 	"github.com/Celaris-dev1/Warrant/internal/ledger"
 	"github.com/Celaris-dev1/Warrant/internal/pep"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
@@ -38,12 +44,10 @@ func env(k, d string) string {
 	return d
 }
 
-func main() {
-	ctx := context.Background()
-	adminTok := os.Getenv("WARRANT_ADMIN_TOKEN")
-	if adminTok == "" {
-		log.Fatal("WARRANT_ADMIN_TOKEN is required")
-	}
+// buildService assembles a broker.Service from the environment: store,
+// signing key, policy and ledger. Shared by the default broker+PEP mode and
+// `warrantd gateway`.
+func buildService(ctx context.Context) (*broker.Service, func() error) {
 	var st store.Store
 	if u := os.Getenv("WARRANT_DATABASE_URL"); u != "" {
 		p, err := store.OpenPostgres(ctx, u)
@@ -77,20 +81,36 @@ func main() {
 	} else {
 		log.Print("WARNING: WARRANT_POLICY unset: everything is denied")
 	}
-	var routes []pep.Route
-	if p := os.Getenv("WARRANT_ROUTES"); p != "" {
-		if routes, err = pep.LoadRoutes(p); err != nil {
-			log.Fatalf("routes: %v", err)
-		}
-	}
 	depth, _ := strconv.Atoi(env("WARRANT_MAX_DEPTH", "1"))
 	rec, closeLedger, err := ledger.FromEnvSpooling(os.Getenv("LEDGER_SPOOL_DIR"))
 	if err != nil {
 		log.Fatalf("ledger: %v", err)
 	}
-	defer closeLedger()
 	svc := broker.New(broker.Config{TrustDomain: env("WARRANT_TRUST_DOMAIN", "warrant.local"), MaxDepth: depth},
 		st, signer, pol, rec)
+	return svc, closeLedger
+}
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "gateway" {
+		runGateway()
+		return
+	}
+	ctx := context.Background()
+	adminTok := os.Getenv("WARRANT_ADMIN_TOKEN")
+	if adminTok == "" {
+		log.Fatal("WARRANT_ADMIN_TOKEN is required")
+	}
+	svc, closeLedger := buildService(ctx)
+	defer closeLedger()
+	var routes []pep.Route
+	if p := os.Getenv("WARRANT_ROUTES"); p != "" {
+		rs, err := pep.LoadRoutes(p)
+		if err != nil {
+			log.Fatalf("routes: %v", err)
+		}
+		routes = rs
+	}
 
 	pepSrv := &http.Server{Addr: env("WARRANT_PEP_ADDR", ":8431"), Handler: pep.New(svc, routes), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
@@ -98,6 +118,50 @@ func main() {
 		log.Fatal(pepSrv.ListenAndServe())
 	}()
 	srv := &http.Server{Addr: env("WARRANT_ADDR", ":8430"), Handler: svc.Handler(adminTok), ReadHeaderTimeout: 5 * time.Second}
-	log.Printf("warrantd broker listening on %s (kid %s)", srv.Addr, signer.KID)
+	log.Printf("warrantd broker listening on %s (kid %s)", srv.Addr, svc.Signer.KID)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// runGateway runs `warrantd gateway`: the MCP/A2A protocol gateway (see
+// internal/gateway) against one configured upstream. It does not run the
+// broker's own admin HTTP API, so WARRANT_ADMIN_TOKEN is not required; it
+// shares every other broker env var (store, signing key, policy, ledger)
+// with the default mode so gateway and broker/PEP instances can be pointed
+// at the same signing key and Postgres.
+//
+// Additional environment:
+//
+//	WARRANT_GATEWAY_PROTOCOL          "mcp" or "a2a" (required)
+//	WARRANT_GATEWAY_UPSTREAM          upstream base URL (required)
+//	WARRANT_GATEWAY_ADDR              listen address (default :8432)
+//	WARRANT_GATEWAY_TOOL_PREFIX       overrides the default "mcp."/"a2a." scope tool prefix
+//	WARRANT_GATEWAY_FILTER_TOOLS_LIST "true" to filter MCP tools/list to permitted tools
+//	WARRANT_GATEWAY_MAX_BODY_BYTES    request body cap (default 1048576)
+func runGateway() {
+	ctx := context.Background()
+	proto := gateway.Protocol(os.Getenv("WARRANT_GATEWAY_PROTOCOL"))
+	if proto != gateway.MCP && proto != gateway.A2A {
+		log.Fatal(`WARRANT_GATEWAY_PROTOCOL must be "mcp" or "a2a"`)
+	}
+	upstream := os.Getenv("WARRANT_GATEWAY_UPSTREAM")
+	if upstream == "" {
+		log.Fatal("WARRANT_GATEWAY_UPSTREAM is required")
+	}
+	svc, closeLedger := buildService(ctx)
+	defer closeLedger()
+
+	gw := gateway.New(svc, proto, upstream)
+	if p := os.Getenv("WARRANT_GATEWAY_TOOL_PREFIX"); p != "" {
+		gw.ToolPrefix = p
+	}
+	if os.Getenv("WARRANT_GATEWAY_FILTER_TOOLS_LIST") == "true" {
+		gw.FilterToolsList = true
+	}
+	if n, err := strconv.ParseInt(os.Getenv("WARRANT_GATEWAY_MAX_BODY_BYTES"), 10, 64); err == nil && n > 0 {
+		gw.MaxBodyBytes = n
+	}
+
+	srv := &http.Server{Addr: env("WARRANT_GATEWAY_ADDR", ":8432"), Handler: gw, ReadHeaderTimeout: 5 * time.Second}
+	log.Printf("warrant gateway (%s) listening on %s -> %s", proto, srv.Addr, upstream)
 	log.Fatal(srv.ListenAndServe())
 }

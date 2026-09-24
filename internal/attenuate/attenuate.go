@@ -30,8 +30,17 @@ var b64 = base64.RawURLEncoding
 // dropped, exactly like broker-side Attenuate. Expires, if non-zero,
 // further caps (never extends) the effective expiry.
 type Block struct {
-	Scopes    []token.Scope     `json:"scopes,omitempty"`
-	Expires   int64             `json:"expires,omitempty"`
+	Scopes  []token.Scope `json:"scopes,omitempty"`
+	Expires int64         `json:"expires,omitempty"`
+	// Cnf, if set, rebinds the chain's effective proof-of-possession holder
+	// key to a new key. To prevent a bearer of the chain bytes from
+	// hijacking PoP protection by rebinding to a key of their own choosing,
+	// Verify requires that a block setting Cnf be signed (Signer/Signature)
+	// by the key matching the CURRENT effective cnf (i.e. only someone who
+	// already holds the current holder's private key can hand off to a new
+	// one). If the chain is not yet holder-bound (no cnf in force), any
+	// signer may introduce one.
+	Cnf       *token.Cnf        `json:"cnf,omitempty"`
 	Nonce     string            `json:"nonce"`
 	Signer    ed25519.PublicKey `json:"signer"` // key that signs THIS block
 	PrevSig   []byte            `json:"prev_sig"` // signature of the previous link (block or base token)
@@ -83,6 +92,20 @@ func New(baseToken string) Chain { return Chain{BaseToken: baseToken} }
 // cryptographically well-formed here; call Verify to check that it is also
 // a legitimate narrowing.
 func (c Chain) Append(priv ed25519.PrivateKey, scopes []token.Scope, expires int64, nonce string) (Chain, error) {
+	return c.appendBlock(priv, scopes, expires, nil, nonce)
+}
+
+// AppendCnf is like Append but additionally rebinds the chain's effective
+// proof-of-possession holder key to cnf. priv must be the CURRENT holder's
+// private key (matching the chain's effective cnf so far), unless the chain
+// is not yet holder-bound, in which case any key may introduce the first
+// cnf. Verify enforces this at check time; Append itself only produces a
+// well-formed (but not yet verified) block.
+func (c Chain) AppendCnf(priv ed25519.PrivateKey, scopes []token.Scope, expires int64, cnf *token.Cnf, nonce string) (Chain, error) {
+	return c.appendBlock(priv, scopes, expires, cnf, nonce)
+}
+
+func (c Chain) appendBlock(priv ed25519.PrivateKey, scopes []token.Scope, expires int64, cnf *token.Cnf, nonce string) (Chain, error) {
 	var prevSig []byte
 	var err error
 	if n := len(c.Blocks); n > 0 {
@@ -96,7 +119,7 @@ func (c Chain) Append(priv ed25519.PrivateKey, scopes []token.Scope, expires int
 	if nonce == "" {
 		nonce = token.NewID()
 	}
-	b := Block{Scopes: scopes, Expires: expires, Nonce: nonce,
+	b := Block{Scopes: scopes, Expires: expires, Cnf: cnf, Nonce: nonce,
 		Signer: priv.Public().(ed25519.PublicKey), PrevSig: prevSig}
 	sb, err := b.signingBytes()
 	if err != nil {
@@ -125,6 +148,14 @@ type Effective struct {
 	Base    token.Claims
 	Scopes  []token.Scope
 	Expires int64
+	// Cnf is the effective proof-of-possession holder key in force: the
+	// base token's cnf, unless a block rebound it (see Block.Cnf).
+	Cnf *token.Cnf
+	// Origins maps each entry of Scopes back to the index in Base.Scopes it
+	// descends from, so a verifier can charge budget against the broker's
+	// own per-scope counters (which are indexed by base scope) while still
+	// enforcing the narrower, offline-attenuated effective scope.
+	Origins []int
 }
 
 // Verify checks the base token against brokerPub, then walks every block:
@@ -142,7 +173,11 @@ func Verify(brokerPub ed25519.PublicKey, c Chain, now time.Time) (Effective, err
 		}
 		return Effective{}, fmt.Errorf("%w: %v", ErrBaseSignature, err)
 	}
-	eff := Effective{Base: base, Scopes: base.Scopes, Expires: base.Expires}
+	origins := make([]int, len(base.Scopes))
+	for i := range origins {
+		origins[i] = i
+	}
+	eff := Effective{Base: base, Scopes: base.Scopes, Expires: base.Expires, Cnf: base.Cnf, Origins: origins}
 	prevSig, err := baseSig(c.BaseToken)
 	if err != nil {
 		return Effective{}, err
@@ -159,8 +194,9 @@ func Verify(brokerPub ed25519.PublicKey, c Chain, now time.Time) (Effective, err
 			return Effective{}, fmt.Errorf("%w (block %d)", ErrBlockSig, i)
 		}
 		newScopes := eff.Scopes
+		newOrigins := eff.Origins
 		if b.Scopes != nil {
-			newScopes = token.Attenuate(eff.Scopes, b.Scopes)
+			newScopes, newOrigins = attenuateWithOrigin(eff.Scopes, eff.Origins, b.Scopes)
 			if len(newScopes) == 0 {
 				return Effective{}, fmt.Errorf("%w (block %d)", ErrEmpty, i)
 			}
@@ -178,13 +214,42 @@ func Verify(brokerPub ed25519.PublicKey, c Chain, now time.Time) (Effective, err
 			}
 			newExpires = b.Expires
 		}
-		eff.Scopes, eff.Expires = newScopes, newExpires
+		if b.Cnf != nil {
+			// Rebinding is only legitimate if it is authorized by the
+			// CURRENT holder: the block must be signed by the key that
+			// matches the effective cnf in force so far. Otherwise anyone
+			// who merely possesses the bearer chain bytes could rebind PoP
+			// protection to a key of their own and defeat it entirely.
+			if eff.Cnf != nil && token.Thumbprint(b.Signer) != eff.Cnf.JKT {
+				return Effective{}, fmt.Errorf("%w (block %d): cnf rebind not signed by current holder key", ErrWidened, i)
+			}
+			eff.Cnf = b.Cnf
+		}
+		eff.Scopes, eff.Origins, eff.Expires = newScopes, newOrigins, newExpires
 		prevSig = b.Signature
 	}
 	if now.Unix() >= eff.Expires {
 		return Effective{}, ErrBaseExpired
 	}
 	return eff, nil
+}
+
+// attenuateWithOrigin mirrors token.Attenuate's structural intersection
+// (for each requested scope, intersect against every current effective
+// scope) while tracking, for every resulting scope, which base-token scope
+// index it ultimately descends from.
+func attenuateWithOrigin(parent []token.Scope, parentOrigins []int, requested []token.Scope) ([]token.Scope, []int) {
+	var out []token.Scope
+	var origins []int
+	for _, r := range requested {
+		for i, p := range parent {
+			if s, ok := token.Intersect(r, p); ok {
+				out = append(out, s)
+				origins = append(origins, parentOrigins[i])
+			}
+		}
+	}
+	return out, origins
 }
 
 func bytesEqual(a, b []byte) bool {
