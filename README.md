@@ -9,6 +9,22 @@ The aim: "what's the worst a compromised sub-agent could do" becomes a small,
 bounded number you can compute, not "everything the original credential could
 do."
 
+## Setup
+
+Requirements: Go 1.24+ and Postgres 16 (or Docker to run it). Python 3 only for the Python SDK.
+
+```sh
+scripts/setup.sh            # check prerequisites, build, create the database on local Postgres, write .env
+scripts/setup.sh --docker   # same, but start Postgres with docker compose
+scripts/setup.sh --no-db    # build only
+set -a; . ./.env; set +a    # load the generated config into your shell
+```
+
+The script builds `bin/warrantd`, creates the `warrant` database if Postgres is reachable
+(override the admin connection with `PG_ADMIN_URL`), and writes a `.env` (mode 0600, gitignored)
+with freshly generated tokens and keys. It is safe to re-run: an existing `.env` or database
+is never overwritten. It finishes by printing the commands to start Warrant.
+
 ## Quickstart
 
 ```bash
@@ -288,3 +304,8 @@ Not yet built (the "fully built version"):
   the gateway speaks MCP/A2A JSON-RPC over Streamable HTTP, not SSE/stdio
   transports.
 - Pruning of expired rows (tokens, counters, used approvals).
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE). Self-hosted: you run Warrant on your own
+infrastructure. No hosted service is required and none is contacted.
