@@ -159,8 +159,10 @@ A constrained argument has to be present in the call.
   decision records also carries a signed `payload.receipt`: a `stack-receipt/v1` envelope
   (`internal/receipt`, self-contained copy of Ledger's `docs/receipt-spec.md` reference
   implementation, validated against Ledger's conformance vectors in `testdata/receipts/`)
-  signed with the broker's own Ed25519 token-signing key, so `ledger incident` can verify the
-  decision independently of trusting Ledger's storage.
+  signed with a persistent Ed25519 key (`WARRANT_RECEIPT_KEY`, base64 seed, or a key file at
+  `WARRANT_RECEIPT_KEY_FILE`/the user config dir, created on first use; see `warrantd keys
+  show`), so `ledger incident` can verify the decision independently of trusting Ledger's
+  storage, and `signer_key_id` stays stable across restarts.
 
 ### HTTP API (broker, :8430)
 

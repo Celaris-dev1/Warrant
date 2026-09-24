@@ -5,6 +5,9 @@
 //	WARRANT_DATABASE_URL   Postgres URL (unset => in-memory store, dev only)
 //	WARRANT_ADMIN_TOKEN    bearer token for admin endpoints (required)
 //	WARRANT_SIGNING_KEY    base64 32-byte Ed25519 seed (unset => ephemeral key)
+//	WARRANT_RECEIPT_KEY, WARRANT_RECEIPT_KEY_FILE  persistent stack-receipt/v1 signing key
+//	                       (see `warrantd keys show`; unset => key persisted under the user
+//	                       config dir, or an ephemeral key if that is unwritable)
 //	WARRANT_POLICY         path to JSON policy file (unset => default deny)
 //	WARRANT_ROUTES         path to JSON PEP routes file
 //	WARRANT_TRUST_DOMAIN   SPIFFE trust domain (default warrant.local)
@@ -33,6 +36,7 @@ import (
 	"github.com/Celaris-dev1/Warrant/internal/ledger"
 	"github.com/Celaris-dev1/Warrant/internal/pep"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
+	"github.com/Celaris-dev1/Warrant/internal/receipt"
 	"github.com/Celaris-dev1/Warrant/internal/store"
 	"github.com/Celaris-dev1/Warrant/internal/token"
 )
@@ -88,10 +92,21 @@ func buildService(ctx context.Context) (*broker.Service, func() error) {
 	}
 	svc := broker.New(broker.Config{TrustDomain: env("WARRANT_TRUST_DOMAIN", "warrant.local"), MaxDepth: depth},
 		st, signer, pol, rec)
+	rs, err := receipt.DefaultSigner()
+	if err != nil {
+		log.Fatalf("receipt signing key: %v", err)
+	}
+	svc.ReceiptSigner = &rs
 	return svc, closeLedger
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "keys" {
+		if err := cmdKeys(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "gateway" {
 		runGateway()
 		return
