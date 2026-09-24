@@ -43,7 +43,7 @@ func TestSpoolingClientNeverDropsWhileDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc.Interval = time.Hour // control draining manually
+	sc.SetInterval(time.Hour) // control draining manually
 	defer sc.Close()
 
 	ctx := context.Background()
@@ -85,7 +85,7 @@ func TestSpoolingClientSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc.Interval = time.Hour
+	sc.SetInterval(time.Hour)
 	ctx := context.Background()
 	if err := sc.Record(ctx, mustRec("x")); err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestSpoolingClientSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc2.Interval = time.Hour
+	sc2.SetInterval(time.Hour)
 	defer sc2.Close()
 	if got := sc2.Pending(); got != 1 {
 		t.Fatalf("pending after restart = %d, want 1", got)
@@ -121,7 +121,7 @@ func TestSpoolingClientBackgroundLoopDrains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc.Interval = 20 * time.Millisecond
+	sc.SetInterval(20 * time.Millisecond)
 	defer sc.Close()
 	ctx := context.Background()
 	if err := sc.Record(ctx, mustRec("bg")); err != nil {

@@ -20,14 +20,29 @@ import (
 type SpoolingClient struct {
 	Upstream Recorder
 	Dir      string
-	Interval time.Duration // retry period; default 5s
 
-	mu   sync.Mutex
-	file *os.File
+	mu       sync.Mutex
+	interval time.Duration // retry period; default 5s
+	file     *os.File
 
 	closeOnce sync.Once
 	stop      chan struct{}
 	done      chan struct{}
+}
+
+// SetInterval changes the background retry period (safe for concurrent use,
+// including while the loop is running; tests use this instead of writing a
+// field directly, which would race with the loop goroutine's read of it).
+func (sc *SpoolingClient) SetInterval(d time.Duration) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.interval = d
+}
+
+func (sc *SpoolingClient) getInterval() time.Duration {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.interval
 }
 
 // spoolEntry is one line of the spool file.
@@ -45,7 +60,7 @@ func NewSpoolingClient(upstream Recorder, dir string) (*SpoolingClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ledger spool: %w", err)
 	}
-	sc := &SpoolingClient{Upstream: upstream, Dir: dir, Interval: 5 * time.Second, file: f,
+	sc := &SpoolingClient{Upstream: upstream, Dir: dir, interval: 5 * time.Second, file: f,
 		stop: make(chan struct{}), done: make(chan struct{})}
 	go sc.loop()
 	return sc, nil
@@ -85,16 +100,16 @@ func (sc *SpoolingClient) append(r Record) error {
 	return sc.file.Sync()
 }
 
-// loop periodically attempts to drain the spool.
+// loop periodically attempts to drain the spool. It rechecks the interval
+// each cycle (via getInterval, which locks) so SetInterval can safely
+// change the retry period while the loop is running, without a data race.
 func (sc *SpoolingClient) loop() {
 	defer close(sc.done)
-	t := time.NewTicker(sc.Interval)
-	defer t.Stop()
 	for {
 		select {
 		case <-sc.stop:
 			return
-		case <-t.C:
+		case <-time.After(sc.getInterval()):
 			sc.drain()
 		}
 	}
