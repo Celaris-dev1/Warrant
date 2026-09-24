@@ -18,10 +18,12 @@ CREATE TABLE IF NOT EXISTS warrant_tokens (
   id TEXT PRIMARY KEY, parent TEXT, parent_actor TEXT, goal_id TEXT, subject TEXT NOT NULL, human TEXT NOT NULL, depth INT NOT NULL,
   max_calls INT NOT NULL, scope_limits INT[] NOT NULL, expires TIMESTAMPTZ NOT NULL, claims JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS warrant_tokens_parent ON warrant_tokens(parent);
-CREATE INDEX IF NOT EXISTS warrant_tokens_goal ON warrant_tokens(goal_id);
+-- Migrations for tables that may already exist from an older schema version
+-- (must run before any index/query below that references these columns).
 ALTER TABLE warrant_tokens ADD COLUMN IF NOT EXISTS parent_actor TEXT;
 ALTER TABLE warrant_tokens ADD COLUMN IF NOT EXISTS goal_id TEXT;
+CREATE INDEX IF NOT EXISTS warrant_tokens_parent ON warrant_tokens(parent);
+CREATE INDEX IF NOT EXISTS warrant_tokens_goal ON warrant_tokens(goal_id);
 CREATE TABLE IF NOT EXISTS warrant_revocations (
   id TEXT PRIMARY KEY, reason TEXT NOT NULL, revoked_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS warrant_counters (
