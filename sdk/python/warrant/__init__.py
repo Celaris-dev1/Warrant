@@ -95,6 +95,22 @@ class Agent:
                    "X-Warrant-Approval": self._approvals.pop(tool, "")}
         return _request("POST", f"{self.pep_url}/call/{tool}", {"resource": resource, "args": args or {}}, headers, self.timeout)
 
+    def authorize(self, tool: str, resource: str, args: Optional[dict] = None) -> dict:
+        """Ask the broker whether (tool, resource, args) would be allowed,
+        without forwarding to any upstream tool. Framework adapters
+        (`warrant.adapters`) use this to gate a *locally implemented* tool
+        function: authorize first, then only call the function body if
+        allowed, so a denial never executes it. Raises Denied on refusal.
+        """
+        headers = {"Authorization": "Bearer " + self.token, "X-Warrant-SVID": self.svid,
+                   "X-Warrant-Approval": self._approvals.pop(tool, "")}
+        body = {"token": self.token, "svid": self.svid, "approval": headers["X-Warrant-Approval"],
+                "call": {"tool": tool, "resource": resource, "args": args or {}}}
+        out = _request("POST", self.broker_url + "/v1/authorize", body, timeout=self.timeout)
+        if not out.get("allow"):
+            raise Denied(403, out.get("reason") or "denied")
+        return out
+
 
 class Admin:
     def __init__(self, broker_url: str, admin_token: str):
