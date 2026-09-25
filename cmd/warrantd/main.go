@@ -34,6 +34,7 @@ import (
 	"github.com/Celaris-dev1/Warrant/internal/broker"
 	"github.com/Celaris-dev1/Warrant/internal/gateway"
 	"github.com/Celaris-dev1/Warrant/internal/ledger"
+	"github.com/Celaris-dev1/Warrant/internal/license"
 	"github.com/Celaris-dev1/Warrant/internal/pep"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
 	"github.com/Celaris-dev1/Warrant/internal/receipt"
@@ -111,6 +112,12 @@ func main() {
 		runGateway()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "license" {
+		if err := cmdLicense(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	ctx := context.Background()
 	adminTok := os.Getenv("WARRANT_ADMIN_TOKEN")
 	if adminTok == "" {
@@ -170,6 +177,9 @@ func runGateway() {
 		gw.ToolPrefix = p
 	}
 	if os.Getenv("WARRANT_GATEWAY_FILTER_TOOLS_LIST") == "true" {
+		if err := license.Require(license.FeatureGatewayToolFilter); err != nil {
+			log.Fatal(err)
+		}
 		gw.FilterToolsList = true
 	}
 	if n, err := strconv.ParseInt(os.Getenv("WARRANT_GATEWAY_MAX_BODY_BYTES"), 10, 64); err == nil && n > 0 {
