@@ -9,7 +9,7 @@ package adapters
 // structurally, the same way it would deny an honest mistake.
 //
 // See docs/injection-suite.md for the attack catalogue this file
-// implements, one subtest group per row, plus two documented limitations
+// implements, one subtest group per row, plus one documented limitation
 // (path-traversal and unconstrained-argument smuggling) that are properties
 // of what the *caller* hands Warrant, not bugs Warrant can fix internally.
 
@@ -22,15 +22,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Celaris-dev1/Warrant/internal/broker"
 	"github.com/Celaris-dev1/Warrant/internal/gateway"
-	"github.com/Celaris-dev1/Warrant/internal/pop"
 	"github.com/Celaris-dev1/Warrant/internal/policy"
+	"github.com/Celaris-dev1/Warrant/internal/pop"
 	"github.com/Celaris-dev1/Warrant/internal/store"
 	"github.com/Celaris-dev1/Warrant/internal/token"
 )
@@ -94,14 +93,14 @@ func TestInjectionToolNameSmuggling(t *testing.T) {
 		name string
 		tool string
 	}{
-		{"wildcard_as_literal", "fs.*"},                  // asking for the pattern itself, not a concrete tool
-		{"sibling_tool", "fs.write"},                      // adjacent tool the scope never granted
-		{"null_byte_suffix", "fs.read\x00fs.write"},       // NUL smuggling past a naive string check
-		{"path_style_traversal", "fs.read/../fs.write"},   // tool names are opaque strings, not paths
-		{"case_variant", "FS.READ"},                       // case must not be folded to bypass exact match
-		{"trailing_dot_widen", "fs.read."},                // near-miss must not match
-		{"embedded_wildcard", "fs.re*d"},                  // wildcard only valid as a single trailing '*'
-		{"unicode_lookalike", "fs.rеad"},                  // Cyrillic 'е' (U+0435) look-alike of "read"
+		{"wildcard_as_literal", "fs.*"},                 // asking for the pattern itself, not a concrete tool
+		{"sibling_tool", "fs.write"},                    // adjacent tool the scope never granted
+		{"null_byte_suffix", "fs.read\x00fs.write"},     // NUL smuggling past a naive string check
+		{"path_style_traversal", "fs.read/../fs.write"}, // tool names are opaque strings, not paths
+		{"case_variant", "FS.READ"},                     // case must not be folded to bypass exact match
+		{"trailing_dot_widen", "fs.read."},              // near-miss must not match
+		{"embedded_wildcard", "fs.re*d"},                // wildcard only valid as a single trailing '*'
+		{"unicode_lookalike", "fs.rеad"},                // Cyrillic 'е' (U+0435) look-alike of "read"
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -132,16 +131,10 @@ func TestInjectionToolNameSmuggling(t *testing.T) {
 //     (including via ".." or encoding) are denied by byte-prefix matching
 //     alone — no traversal semantics required.
 //   - "documented_limitation": a request whose *literal bytes* stay inside
-//     the granted prefix (e.g. "repo/acme/docs/../secrets/key" — the bytes
-//     "repo/acme/docs/" are still a byte-prefix of the whole string) is
-//     structurally indistinguishable, to Warrant, from a legitimate
-//     sub-path. If the upstream tool then resolves "../" against the
-//     filesystem, the effective resource escapes the intended directory
-//     even though Warrant allowed it. See docs/injection-suite.md for why
-//     this is the integration's responsibility (canonicalize a resource
-//     with path.Clean, and reject any result starting with ".." or
-//     containing a NUL byte, before calling Warrant) and not something
-//     Warrant can safely "fix" by guessing path semantics for every tool.
+//     the granted prefix (e.g. "repo/acme/docs/../secrets/key") used to pass a
+//     pure byte-prefix check. Warrant now denies any wildcard match whose
+//     subject contains a ".." segment, a backslash, a NUL byte, or a
+//     percent-encoded dot/slash/backslash/NUL (token.Match).
 func TestInjectionResourceTraversalAndEncoding(t *testing.T) {
 	svc, worker, kid, _ := scenarioHarness(t)
 	e := New(svc)
@@ -151,11 +144,11 @@ func TestInjectionResourceTraversalAndEncoding(t *testing.T) {
 		name     string
 		resource string
 	}{
-		{"dotdot_escapes_prefix", "repo/acme/../secrets/key"},               // leaves "repo/acme/docs/" prefix entirely
-		{"sibling_tenant", "repo/acme-docs-evil/x"},                         // prefix-lookalike, not the real prefix
-		{"encoded_slash_breaks_prefix", "repo/acme/docs%2F..%2Fsecrets"},    // literal bytes don't match "docs/"
-		{"absolute_path_override", "/etc/passwd"},                          // absolute path, no relation to the prefix
-		{"backslash_variant", `repo\acme\docs\..\secrets`}, // different separator, not a prefix match either
+		{"dotdot_escapes_prefix", "repo/acme/../secrets/key"},            // leaves "repo/acme/docs/" prefix entirely
+		{"sibling_tenant", "repo/acme-docs-evil/x"},                      // prefix-lookalike, not the real prefix
+		{"encoded_slash_breaks_prefix", "repo/acme/docs%2F..%2Fsecrets"}, // literal bytes don't match "docs/"
+		{"absolute_path_override", "/etc/passwd"},                        // absolute path, no relation to the prefix
+		{"backslash_variant", `repo\acme\docs\..\secrets`},               // different separator, not a prefix match either
 	}
 	for _, c := range deniedCases {
 		t.Run("outside_prefix/"+c.name, func(t *testing.T) {
@@ -167,52 +160,33 @@ func TestInjectionResourceTraversalAndEncoding(t *testing.T) {
 		})
 	}
 
-	// Documented limitation, demonstrated rather than hidden: a traversal
-	// string whose bytes remain inside the granted prefix is allowed by
-	// Warrant's byte-prefix scope match, exactly as a legitimate deeper
-	// sub-path would be. This is why docs/injection-suite.md requires
-	// callers to canonicalize (path.Clean) resource strings derived from
-	// untrusted input before presenting them to Warrant.
-	t.Run("documented_limitation/raw_dotdot_inside_prefix", func(t *testing.T) {
-		raw := "repo/acme/docs/../docs/intro.md" // byte-prefix "repo/acme/docs/" holds; resolves to the same file anyway
-		_, err := MCPGate(context.Background(), e, creds, MCPToolCall{Name: "fs.read", Resource: raw})
-		if err != nil {
-			t.Fatalf("byte-prefix match allows this string (expected, and why callers must canonicalize): %v", err)
-		}
-		// The FIX an integration applies: canonicalize before calling
-		// Warrant, exactly as docs/injection-suite.md prescribes. Once
-		// canonicalized, a genuine escape attempt is denied by the normal
-		// prefix check because the cleaned path no longer starts with the
-		// granted prefix.
-		escape := "repo/acme/docs/../../secrets/key"
-		cleaned := path.Clean(escape)
-		if strings.HasPrefix(cleaned, "..") || strings.Contains(cleaned, "\x00") {
-			t.Fatalf("canonicalization should not itself produce a rejected form here")
-		}
-		_, err = MCPGate(context.Background(), e, creds, MCPToolCall{Name: "fs.read", Resource: cleaned})
-		var den *Denied
-		if !errors.As(err, &den) {
-			t.Fatalf("canonicalized escape %q should be denied, got %v", cleaned, err)
-		}
-	})
+	// Traversal and encoding tricks that keep the granted byte-prefix are
+	// denied by Warrant itself (token.Match), not left to each caller.
+	insidePrefix := []struct{ name, resource string }{
+		{"raw_dotdot_inside_prefix", "repo/acme/docs/../secrets/key"},
+		{"dotdot_resolving_back_inside", "repo/acme/docs/../docs/intro.md"},
+		{"null_byte_inside_prefix", "repo/acme/docs/intro.md\x00/../../etc/passwd"},
+		{"encoded_dotdot_inside_prefix", "repo/acme/docs/%2e%2e/secrets"},
+		{"encoded_slash_inside_prefix", "repo/acme/docs/..%2Fsecrets"},
+		{"backslash_inside_prefix", `repo/acme/docs/..\secrets`},
+	}
+	for _, c := range insidePrefix {
+		t.Run("inside_prefix/"+c.name, func(t *testing.T) {
+			if !strings.HasPrefix(c.resource, "repo/acme/docs/") {
+				t.Fatalf("test setup: %q should share the granted byte-prefix", c.resource)
+			}
+			_, err := MCPGate(context.Background(), e, creds, MCPToolCall{Name: "fs.read", Resource: c.resource})
+			var den *Denied
+			if !errors.As(err, &den) {
+				t.Fatalf("traversal inside prefix %q should be denied, got %v", c.resource, err)
+			}
+		})
+	}
 
-	// Also documented: a NUL byte embedded in the resource string does not
-	// truncate Go's byte-prefix comparison the way it might truncate a C
-	// string somewhere downstream (e.g. a naive C-based file API). Warrant
-	// itself treats the whole byte sequence literally, so a string that
-	// still shares the granted byte-prefix is allowed by Warrant even
-	// though a downstream NUL-truncation bug could make it resolve to
-	// something else entirely — again, an argument for canonicalizing and
-	// rejecting embedded NULs before calling Warrant, not something Warrant
-	// can detect on its own without knowing the downstream tool's parsing.
-	t.Run("documented_limitation/null_byte_inside_prefix", func(t *testing.T) {
-		raw := "repo/acme/docs/intro.md\x00/../../etc/passwd"
-		if !strings.HasPrefix(raw, "repo/acme/docs/") {
-			t.Fatalf("test setup: expected raw to share the granted byte-prefix")
-		}
-		_, err := MCPGate(context.Background(), e, creds, MCPToolCall{Name: "fs.read", Resource: raw})
-		if err != nil {
-			t.Fatalf("byte-prefix match allows this string (expected; canonicalize and reject embedded NULs before calling Warrant): %v", err)
+	// A legitimate deeper path is still allowed.
+	t.Run("legit_subpath_allowed", func(t *testing.T) {
+		if _, err := MCPGate(context.Background(), e, creds, MCPToolCall{Name: "fs.read", Resource: "repo/acme/docs/guide/intro.md"}); err != nil {
+			t.Fatalf("legitimate sub-path denied: %v", err)
 		}
 	})
 }
@@ -375,7 +349,7 @@ func TestInjectionReplay(t *testing.T) {
 		}
 		root, err := svc.MintRoot(ctx, broker.MintRequest{SVID: svid, Human: "h",
 			Scopes: []token.Scope{{Tool: "fs.read", Resources: []string{"*"}, MaxCalls: 5}},
-			Cnf: &token.Cnf{JKT: token.Thumbprint(pub)}})
+			Cnf:    &token.Cnf{JKT: token.Thumbprint(pub)}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -471,7 +445,7 @@ func TestInjectionTokenTheftWithoutPoPKey(t *testing.T) {
 	}
 	root, err := svc.MintRoot(ctx, broker.MintRequest{SVID: svid, Human: "h",
 		Scopes: []token.Scope{{Tool: "mcp.fs.read", Resources: []string{"*"}, MaxCalls: 5}},
-		Cnf: &token.Cnf{JKT: token.Thumbprint(holderPub)}})
+		Cnf:    &token.Cnf{JKT: token.Thumbprint(holderPub)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -765,4 +739,3 @@ func decodeAny(r *http.Request) (any, error) {
 	err := json.NewDecoder(r.Body).Decode(&v)
 	return v, err
 }
-

@@ -28,15 +28,36 @@ func ValidatePattern(p string) error {
 	return nil
 }
 
-func isWild(p string) bool { return strings.HasSuffix(p, "*") }
+func isWild(p string) bool   { return strings.HasSuffix(p, "*") }
 func prefix(p string) string { return strings.TrimSuffix(p, "*") }
 
 // Match reports whether s matches pattern p.
+//
+// A prefix wildcard never matches a subject that could escape the prefix once
+// a tool resolves it ("repo/acme/docs/../secrets", "%2e%2e", "a\\..\\b"):
+// Warrant denies those itself rather than trusting every caller to clean paths.
 func Match(p, s string) bool {
 	if isWild(p) {
-		return strings.HasPrefix(s, prefix(p))
+		return strings.HasPrefix(s, prefix(p)) && !escapesPrefix(s)
 	}
 	return p == s
+}
+
+// escapesPrefix reports whether s contains a traversal or encoding trick.
+func escapesPrefix(s string) bool {
+	if strings.ContainsAny(s, "\\\x00") {
+		return true
+	}
+	l := strings.ToLower(s)
+	if strings.Contains(l, "%2e") || strings.Contains(l, "%2f") || strings.Contains(l, "%5c") || strings.Contains(l, "%00") {
+		return true
+	}
+	for _, seg := range strings.Split(s, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // PatternSubset reports whether every string matched by child is matched by parent.

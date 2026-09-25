@@ -219,3 +219,28 @@ func TestActionHashCanonical(t *testing.T) {
 		t.Fatal("hash collision on different args")
 	}
 }
+
+func TestMatchDeniesPrefixEscapes(t *testing.T) {
+	p := "repo/acme/docs/*"
+	for _, s := range []string{
+		"repo/acme/docs/../secrets",
+		"repo/acme/docs/..",
+		"repo/acme/docs/a/../../x",
+		"repo/acme/docs/%2e%2e/x",
+		"repo/acme/docs/%2E%2E/x",
+		"repo/acme/docs/..%2fx",
+		"repo/acme/docs/..%5cx",
+		`repo/acme/docs/..\x`,
+		"repo/acme/docs/a\x00/../x",
+		"repo/acme/docs/a%00b",
+	} {
+		if Match(p, s) {
+			t.Errorf("Match(%q, %q) = true, want false", p, s)
+		}
+	}
+	for _, s := range []string{"repo/acme/docs/a", "repo/acme/docs/a/b.md", "repo/acme/docs/..hidden", "repo/acme/docs/a..b"} {
+		if !Match(p, s) {
+			t.Errorf("Match(%q, %q) = false, want true", p, s)
+		}
+	}
+}
