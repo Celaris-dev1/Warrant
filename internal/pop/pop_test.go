@@ -137,7 +137,17 @@ func TestVerifyRejectsTamperedProof(t *testing.T) {
 	tc := mkToken(t, Thumbprint(pub))
 	now := time.Now()
 	proof, _ := Sign(priv, tc.ID, "aud", "GET", "/x", 30*time.Second, now)
-	tampered := proof[:len(proof)-2] + "AA"
+	// Flip one character well inside the signature segment (not the last
+	// two, whose base64 encoding carries only a couple of unused padding
+	// bits and can — rarely, but non-deterministically — decode back to the
+	// same signature bytes and make this test flaky). Flipping a character
+	// mid-signature always changes at least one decoded byte.
+	i := len(proof) / 2
+	var repl byte = 'A'
+	if proof[i] == 'A' {
+		repl = 'B'
+	}
+	tampered := proof[:i] + string(repl) + proof[i+1:]
 	rs := NewMemoryReplayStore()
 	if _, err := Verify(pub, tampered, tc, "aud", now, rs); err == nil {
 		t.Fatal("tampered proof accepted")
