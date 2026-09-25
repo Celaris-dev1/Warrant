@@ -312,7 +312,51 @@ Not yet built (the "fully built version"):
   transports.
 - Pruning of expired rows (tokens, counters, used approvals).
 
+## LICENSING (Enterprise add-ons)
+
+Warrant is open core. Token mint/verify, the PEP, `warrantd gateway` and the MCP/A2A/OpenAI/
+LangChain adapters are free and always will be; see [PRICING.md](PRICING.md). One Enterprise
+add-on requires a paid, offline license key: `WARRANT_LICENSE` (a token) or
+`WARRANT_LICENSE_FILE` (a path). Verification is Ed25519-signature checking against a vendor
+public key compiled into the binary (`internal/license`) — no network call, no phone-home,
+works air-gapped.
+
+Gated feature:
+
+- **Gateway tools/list filtering** — `WARRANT_GATEWAY_FILTER_TOOLS_LIST=true`, which trims
+  an MCP `tools/list` response down to the tools the presented credential's scopes allow.
+  Passthrough gateway operation (routing, PoP, authorize/deny, batching) stays free.
+
+States: **none** (no license — core works fully, gated features are off), **valid**,
+**grace** (up to 14 days past expiry — gated features keep working with a loud warning),
+**expired** (gated features off). An invalid or tampered token is treated as no license,
+with a warning — `warrantd gateway` never fails a build over a bad token, and never deletes
+or hides data when a feature turns off (it refuses to start with a gated config instead).
+
+- `warrantd license show [--json]` / `warrantd license verify <token|file>` — inspect the
+  current or a given license, entirely offline.
+
+**Issuing licenses** (vendor only — needs the private signing key, which must never be
+committed):
+
+```
+go run -tags licensegen ./tools/licensegen keygen --out priv.key      # keep priv.key OFFLINE
+go run -tags licensegen ./tools/licensegen issue --key priv.key \
+    --customer "Acme Inc" --edition enterprise --seats 10 --days 365 > license.tok
+```
+
+`tools/licensegen` is a separate `main` package behind the `licensegen` build tag, so
+`go build ./...` and the released `warrantd` binary never include it. After generating a
+real keypair, put its **public** key into `internal/license/keys.go`'s `prodPublicKeyB64`
+and cut a release; the private key stays with the vendor, offline, always.
+
+The repo also carries a public **dev** keypair (`licensegen issue --key dev`) for tests.
+Release builds never trust it; only binaries built with `-tags licensedev` (the e2e harness)
+do. Never ship a `licensedev` build.
+
 ## License
 
 Apache License 2.0; see [LICENSE](LICENSE). Self-hosted: you run Warrant on your own
-infrastructure. No hosted service is required and none is contacted.
+infrastructure. No hosted service is required and none is contacted. (This is the source
+license for the Warrant codebase itself; see PRICING.md and LICENSING above for the paid
+Enterprise feature key, a separate, additive mechanism, not the code license.)

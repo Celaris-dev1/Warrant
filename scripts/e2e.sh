@@ -39,7 +39,10 @@ trap cleanup EXIT
 WORKDIR="$(mktemp -d)"
 
 log "building warrantd"
-go build -o "$WORKDIR/warrantd" ./cmd/warrantd
+# -tags licensedev: lets e2e exercise Enterprise-gated features (e.g. the gateway's
+# tools/list filter) with a throwaway license signed by the repo's public dev key (see
+# internal/license). A plain `go build` (no tags) never trusts that key.
+go build -tags licensedev -o "$WORKDIR/warrantd" ./cmd/warrantd
 
 log "checking Postgres is reachable..."
 if ! psql "$DB_URL" -c 'select 1' >/dev/null 2>&1; then
