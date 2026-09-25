@@ -11,7 +11,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unsafe"
 )
+
+// UnsafeBytes views s as a []byte without copying. Safe only for read-only
+// uses that don't retain the slice beyond the call and don't mutate it — the
+// intended (and only current) use is as the message argument to
+// ed25519.Verify, which does neither.
+func UnsafeBytes(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
 
 // Claims are the body of a Warrant capability token.
 type Claims struct {
@@ -119,26 +132,55 @@ var (
 	ErrExpired   = errors.New("token expired")
 )
 
+// jwtHeader is the minimal EdDSA compact-JWT header. Decoding into a typed
+// struct (rather than a map[string]string) avoids a map allocation and its
+// hashing/bucket overhead on every verify — the header is fixed-shape, so
+// there is nothing a map buys us here.
+type jwtHeader struct {
+	Alg string `json:"alg"`
+}
+
 // Verify checks signature and expiry (with the given clock) and returns claims.
+//
+// The two Ed25519 field elements (the double-scalar-multiply in
+// ed25519.Verify) dominate this function's cost by roughly an order of
+// magnitude over everything else combined (see docs/benchmarks.md); the
+// allocation-avoidance below trims the non-crypto remainder but cannot
+// change that floor.
 func Verify(pub ed25519.PublicKey, tok string, now time.Time) (Claims, error) {
 	var c Claims
-	parts := strings.Split(tok, ".")
-	if len(parts) != 3 {
+	// Manual split instead of strings.Split: exactly two separators expected,
+	// no need to allocate a []string for the general case.
+	i := strings.IndexByte(tok, '.')
+	if i < 0 {
 		return c, ErrMalformed
 	}
-	var hdr map[string]string
-	hb, err := b64.DecodeString(parts[0])
-	if err != nil || json.Unmarshal(hb, &hdr) != nil || hdr["alg"] != "EdDSA" {
+	j := strings.IndexByte(tok[i+1:], '.')
+	if j < 0 {
 		return c, ErrMalformed
 	}
-	sig, err := b64.DecodeString(parts[2])
+	j += i + 1
+	hdrPart, bodyPart, sigPart := tok[:i], tok[i+1:j], tok[j+1:]
+	if strings.IndexByte(sigPart, '.') >= 0 {
+		return c, ErrMalformed // more than 3 segments
+	}
+	var hdr jwtHeader
+	hb, err := b64.DecodeString(hdrPart)
+	if err != nil || json.Unmarshal(hb, &hdr) != nil || hdr.Alg != "EdDSA" {
+		return c, ErrMalformed
+	}
+	sig, err := b64.DecodeString(sigPart)
 	if err != nil {
 		return c, ErrMalformed
 	}
-	if !ed25519.Verify(pub, []byte(parts[0]+"."+parts[1]), sig) {
+	// Verify the signature over the ASCII "header.body" span in place,
+	// without concatenating a new string (the signing input is already
+	// contiguous in tok, since hdrPart and bodyPart came from it).
+	signingInput := tok[:j]
+	if !ed25519.Verify(pub, UnsafeBytes(signingInput), sig) {
 		return c, ErrSignature
 	}
-	bb, err := b64.DecodeString(parts[1])
+	bb, err := b64.DecodeString(bodyPart)
 	if err != nil || json.Unmarshal(bb, &c) != nil {
 		return c, ErrMalformed
 	}

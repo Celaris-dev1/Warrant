@@ -109,23 +109,34 @@ func Verify(pub ed25519.PublicKey, proof string, tc token.Claims, aud string, no
 	if Thumbprint(pub) != tc.Cnf.JKT {
 		return c, ErrKeyMismatch
 	}
-	parts := strings.Split(proof, ".")
-	if len(parts) != 3 {
+	i := strings.IndexByte(proof, '.')
+	if i < 0 {
 		return c, ErrMalformed
 	}
-	var hdr map[string]string
-	hb, err := b64.DecodeString(parts[0])
-	if err != nil || json.Unmarshal(hb, &hdr) != nil || hdr["alg"] != "EdDSA" {
+	j := strings.IndexByte(proof[i+1:], '.')
+	if j < 0 {
 		return c, ErrMalformed
 	}
-	sig, err := b64.DecodeString(parts[2])
+	j += i + 1
+	hdrPart, bodyPart, sigPart := proof[:i], proof[i+1:j], proof[j+1:]
+	if strings.IndexByte(sigPart, '.') >= 0 {
+		return c, ErrMalformed
+	}
+	var hdr struct {
+		Alg string `json:"alg"`
+	}
+	hb, err := b64.DecodeString(hdrPart)
+	if err != nil || json.Unmarshal(hb, &hdr) != nil || hdr.Alg != "EdDSA" {
+		return c, ErrMalformed
+	}
+	sig, err := b64.DecodeString(sigPart)
 	if err != nil {
 		return c, ErrMalformed
 	}
-	if !ed25519.Verify(pub, []byte(parts[0]+"."+parts[1]), sig) {
+	if !ed25519.Verify(pub, token.UnsafeBytes(proof[:j]), sig) {
 		return c, ErrSignature
 	}
-	bb, err := b64.DecodeString(parts[1])
+	bb, err := b64.DecodeString(bodyPart)
 	if err != nil || json.Unmarshal(bb, &c) != nil {
 		return c, ErrMalformed
 	}
