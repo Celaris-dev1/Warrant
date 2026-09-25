@@ -18,6 +18,11 @@ same headers the standalone PEP gateway understands). A denial is always a
 All five share `Enforcer.Authorize` (`adapters.go`), so a single policy
 change in `internal/policy` applies identically across every framework.
 
+For the full list of framework adapters (Go and Python, 15+ frameworks in
+all — Anthropic, Gemini, Bedrock, gRPC, net/rpc, MCP server middleware,
+LangChain, LlamaIndex, CrewAI, AutoGen, OpenAI Agents SDK, Semantic Kernel,
+Haystack, Pydantic-AI and more), see [`docs/adapters.md`](../docs/adapters.md).
+
 ## Usage
 
 ```go
