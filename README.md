@@ -34,6 +34,19 @@ WARRANT_ADMIN_TOKEN=dev WARRANT_POLICY=examples/policy.json WARRANT_ROUTES=examp
 WARRANT_DATABASE_URL=postgres://postgres:postgres@localhost:5432/warrant go run ./cmd/warrantd
 ```
 
+The Python snippet below uses `"dev"` as the admin token, matching the local
+command above. If you instead started `bin/warrantd` from `scripts/setup.sh`'s
+generated `.env` (`set -a; . ./.env; set +a`), use the random
+`WARRANT_ADMIN_TOKEN` written there instead of `"dev"` — it is not `"dev"`.
+
+The example's `read_file("intro.md")` call is authorized and forwarded by the
+PEP to whatever upstream `examples/routes.json` points at
+(`http://localhost:8499/tool` by default), so the call itself succeeds but
+the final `read_file()` returns a `502` unless something is actually
+listening there. That's expected with the example routes as shipped: point
+`WARRANT_ROUTES` at your own tool server, or run one on `:8499`, to see a
+real response come back.
+
 ```python
 from warrant import Admin, Agent, wrap_tool   # sdk/python, stdlib only
 

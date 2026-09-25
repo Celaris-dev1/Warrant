@@ -25,6 +25,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -101,7 +102,24 @@ func buildService(ctx context.Context) (*broker.Service, func() error) {
 	return svc, closeLedger
 }
 
+const mainUsage = `warrantd runs the Warrant broker API and the PEP gateway.
+
+usage:
+  warrantd              run the broker (:8430) and PEP (:8431)
+  warrantd gateway      run the MCP/A2A protocol gateway instead
+  warrantd keys <cmd>   receipt signing key commands (see 'warrantd keys help')
+  warrantd license <cmd>  license commands (see 'warrantd license help')
+  warrantd help         show this message
+
+See the package doc comment at the top of cmd/warrantd/main.go, or the
+README, for the full list of environment variables.
+`
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help") {
+		fmt.Print(mainUsage)
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "keys" {
 		if err := cmdKeys(os.Args[2:]); err != nil {
 			log.Fatal(err)
@@ -159,7 +177,26 @@ func main() {
 //	WARRANT_GATEWAY_TOOL_PREFIX       overrides the default "mcp."/"a2a." scope tool prefix
 //	WARRANT_GATEWAY_FILTER_TOOLS_LIST "true" to filter MCP tools/list to permitted tools
 //	WARRANT_GATEWAY_MAX_BODY_BYTES    request body cap (default 1048576)
+const gatewayUsage = `warrantd gateway   runs the MCP/A2A protocol gateway instead of the broker+PEP.
+
+usage:
+  warrantd gateway
+
+required env:
+  WARRANT_GATEWAY_PROTOCOL  "mcp" or "a2a"
+  WARRANT_GATEWAY_UPSTREAM  upstream base URL
+
+See the README's "Gateway (MCP / A2A)" section for the full list of
+WARRANT_GATEWAY_* options and the broker env vars it shares.
+`
+
 func runGateway() {
+	for _, a := range os.Args[2:] {
+		if a == "help" || a == "-h" || a == "--help" {
+			fmt.Print(gatewayUsage)
+			return
+		}
+	}
 	ctx := context.Background()
 	proto := gateway.Protocol(os.Getenv("WARRANT_GATEWAY_PROTOCOL"))
 	if proto != gateway.MCP && proto != gateway.A2A {
